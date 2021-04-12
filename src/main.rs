@@ -1,14 +1,16 @@
 use std::convert::{TryFrom, TryInto};
 use std::fmt::{Display, Formatter};
-use std::io::{self, Error, Read, Write, ErrorKind};
+use std::fs::File;
+use std::io::{self, Error, ErrorKind, Read, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 
 use hex;
 use once_cell::sync::Lazy;
-use std::fs::File;
-use std::path::{Path, PathBuf};
 use structopt::StructOpt;
+use std::time::{Instant, Duration};
+use std::cmp::{min, max};
 
 // The format! macro doesn't understand regular constants :(
 macro_rules! MERGE_SOCKET_NAME {
@@ -18,10 +20,7 @@ macro_rules! MERGE_SOCKET_NAME {
 }
 
 #[derive(Debug, Default, StructOpt)]
-#[structopt(
-    name = "streamsplit",
-    about = "Split a byte stream into multiple streams and merge them back"
-)]
+#[structopt(name = "streamsplit", about = "Split a byte stream into multiple streams and merge them back")]
 struct Opt {
     #[structopt(long, conflicts_with = "merge")]
     split: Option<u16>,
@@ -50,6 +49,7 @@ struct Opt {
     #[structopt(long, short, conflicts_with = "sh")]
     no_shell: bool,
 
+    /// timeout when waiting for the master merge socket to appear
     #[structopt(short, long, default_value = "5000")]
     timeout: u32,
 
@@ -152,11 +152,7 @@ impl WriteChainer<'_> {
     fn write(self, data: &[u8]) -> Self {
         let wrote = self.slice.write(&data).unwrap();
         if wrote != data.len() {
-            panic!(
-                "Write to buffer failed, wrote {} out of {} bytes",
-                wrote,
-                data.len()
-            )
+            panic!("Write to buffer failed, wrote {} out of {} bytes", wrote, data.len())
         }
         self
     }
@@ -195,8 +191,7 @@ impl Header {
 
     fn read_from_stream(r: &mut dyn Read, errmsg: &str) -> Header {
         let mut bytes = [0u8; std::mem::size_of::<Header>()];
-        r.read(&mut bytes)
-            .expect("Unable to read header from stream");
+        r.read(&mut bytes).expect("Unable to read header from stream");
         let mut hdr = Header::default();
 
         hdr.magic = bytes[0..12].try_into().unwrap();
@@ -208,16 +203,10 @@ impl Header {
         hdr.streamsplit_id = bytes[32..48].try_into().unwrap();
 
         if hdr.magic != *b"streamsplit;" {
-            panic!(
-                "{}: this stream is not a valid streamsplit stream. Stream marker not found",
-                errmsg
-            );
+            panic!("{}: this stream is not a valid streamsplit stream. Stream marker not found", errmsg);
         }
         if hdr._padding != [0u8; 8] {
-            panic!(
-                "{}: stream header is invalid: invalid padding found",
-                errmsg
-            )
+            panic!("{}: stream header is invalid: invalid padding found", errmsg)
         }
         if hdr.version != 1 {
             panic!(
@@ -226,10 +215,7 @@ impl Header {
             )
         }
         if hdr.stream_id >= hdr.splits {
-            panic!(
-                "{}: The stream has a stream_id >= the number of splits, which is invalid",
-                errmsg
-            )
+            panic!("{}: The stream has a stream_id >= the number of splits, which is invalid", errmsg)
         }
 
         hdr
@@ -261,7 +247,7 @@ fn main() {
     }
 
     if OPTS.merge {
-        merge(&mut io::stdin());
+        merge(Box::new(io::stdin()));
     }
     return;
 
@@ -282,11 +268,11 @@ fn main() {
     }
 }
 
-fn merge(inp: &mut dyn io::Read) {
-    let hdr = Header::read_from_stream(inp, "Invalid input stream");
+fn merge(mut inp: Box<dyn Read>) {
+    let hdr = Header::read_from_stream(&mut inp, "Invalid input stream");
 
     if hdr.stream_id == 0 {
-        merge_master(hdr, Box::new(io::stdin()), Box::new(io::stdout()));
+        merge_master(hdr, inp, Box::new(io::stdout()));
     } else {
         // slave mergers
     }
@@ -298,10 +284,7 @@ struct FileDeleter<'a> {
 impl Drop for FileDeleter<'_> {
     fn drop(&mut self) {
         if let Err(e) = std::fs::remove_file(self.path) {
-            eprintln!(
-                "Deleting listening socket at {} failed",
-                self.path.to_string_lossy()
-            );
+            eprintln!("Deleting listening socket at {} failed", self.path.to_string_lossy());
         };
     }
 }
@@ -311,17 +294,13 @@ fn merge_master(hdr: Header, mut inp: Box<dyn Read>, mut outp: Box<dyn Write>) {
     let old_umask = unsafe { libc::umask(0o177) };
     let socketpath = socket_path(&OPTS.socket_dir, &hdr.streamsplit_id);
     let listener = UnixListener::bind(socketpath.as_path()).unwrap_or_else(|e| {
-        panic!(
-            "Unable to create socket at {}: {:?}",
-            socketpath.as_path().to_string_lossy(),
-            e
-        )
+        panic!("Unable to create socket at {}: {:?}", socketpath.as_path().to_string_lossy(), e)
     });
     unsafe { libc::umask(old_umask) };
     let deleter = FileDeleter { path: &socketpath };
 
     let mut stream_opts = Vec::with_capacity(hdr.splits.usize());
-    for i in 0..hdr.splits {
+    for i in 0..stream_opts.capacity() {
         stream_opts.push(None);
     }
     stream_opts[0] = Some(inp);
@@ -352,17 +331,13 @@ fn merge_master(hdr: Header, mut inp: Box<dyn Read>, mut outp: Box<dyn Write>) {
                     panic!("Invalid merge stream: number of splits does not match, a stream that is not part of this merge set appears to have connected");
                 }
                 if streamhdr.stream_id == 0 {
-                    panic!(
-                        "Invalid merge stream: connecting stream has stream id 0, which is invalid"
-                    )
+                    panic!("Invalid merge stream: connecting stream has stream id 0, which is invalid")
                 }
+
                 stream_opts[streamhdr.stream_id.usize()] = Some(Box::new(stream));
                 connected_slaves += 1;
                 if OPTS.verbose {
-                    eprint!(
-                        "{} of {} merge streams connected\r",
-                        connected_slaves, hdr.splits
-                    );
+                    eprint!("{} of {} merge streams connected\r", connected_slaves, hdr.splits);
                 }
             }
         }
@@ -371,20 +346,14 @@ fn merge_master(hdr: Header, mut inp: Box<dyn Read>, mut outp: Box<dyn Write>) {
         eprintln!()
     }
 
-    let mut streams: Vec<Box<dyn Read>> = stream_opts
-        .drain(0..hdr.splits.usize())
-        .map(|s| s.unwrap())
-        .collect();
+    let mut streams: Vec<Box<dyn Read>> =
+        stream_opts.into_iter().map(|s| s.unwrap()).collect();
 
     'outer: loop {
-        for i in 0..hdr.splits {
-            let state = transfer_block(
-                &mut *streams[i.usize()],
-                &mut *outp,
-                OPTS.blocksize.usize(),
-            ).unwrap();
+        for i in 0..streams.len() {
+            let state = transfer_block(&mut *streams[i], &mut *outp, OPTS.blocksize.usize()).unwrap();
             if state == InputState::Done {
-                break 'outer
+                break 'outer;
             }
         }
     }
@@ -392,12 +361,50 @@ fn merge_master(hdr: Header, mut inp: Box<dyn Read>, mut outp: Box<dyn Write>) {
     check_all_eof(streams.as_mut_slice());
 }
 
+fn merge_slave(hdr: Header, mut inp: Box<dyn Read>) {
+    let socketpath = socket_path(&OPTS.socket_dir, &hdr.streamsplit_id);
+
+    let deadline = Instant::now() + Duration::from_millis(u64::from(OPTS.timeout));
+
+    let mut interval = Duration::from_millis(1);
+
+    // Connect to the merge master's socket, give the master some time to create it but don't wait forever
+    let mut socket = loop {
+        let conn = UnixStream::connect(&socketpath);
+        match conn {
+            Ok(socket) => { break socket }
+            Err(e) => {
+                if e.kind() != ErrorKind::NotFound {
+                    panic!("Error connecting to merge master process: {:?}", e);
+                } else if Instant::now() > deadline {
+                    panic!("Timeout exceeded while trying to connect to merge master");
+                } else {
+                    std::thread::sleep(interval);
+                    interval = min(interval * 2, Duration::from_millis(300)) ;
+                    continue
+                }
+            }
+        }
+    };
+
+    let mut buf = vec![0u8; 64*1024];
+    loop {
+        let count = inp.read(&mut buf).expect("Error reading from stdin");
+        if count == 0 {
+            continue  // EOF
+        }
+        socket.write_all(&buf[..count]).expect("Error writing to merge socket");
+    }
+}
+
 fn check_all_eof(readers: &mut [Box<dyn Read>]) {
     let mut buf = [0u8; 1];
     for mut r in readers.iter_mut() {
         let count = r.read(&mut buf).unwrap();
         if count != 0 {
-            panic!("Not all merge streams were finished at the same time. This could indicate data corruption");
+            panic!(
+                "Not all merge streams were finished at the same time. This could indicate data corruption"
+            );
         }
     }
 }
@@ -412,8 +419,7 @@ fn socket_path(socket_dir: &str, guid: &[u8; 16]) -> PathBuf {
 fn random() -> [u8; 16] {
     let mut r = File::open("/dev/urandom").expect("Failed to open /dev/urandom");
     let mut buf = [0u8; 16];
-    r.read(&mut buf)
-        .expect("Error reading random number from /dev/urandom");
+    r.read(&mut buf).expect("Error reading random number from /dev/urandom");
     buf
 }
 
@@ -468,7 +474,7 @@ fn split(num: u16, command: &Vec<String>) -> Result<(), Error> {
         let status = child.wait().unwrap_or_else(|e| {
             panic!("Error waiting on child {}: {:?}", i, e);
         });
-        if ! status.success() {
+        if !status.success() {
             eprintln!("Error: Child {} exited with status {}", i, status.code().unwrap());
             failure = true;
         }
@@ -482,25 +488,17 @@ fn split(num: u16, command: &Vec<String>) -> Result<(), Error> {
     return Ok(());
 }
 
-fn transfer_block(
-    inp: &mut dyn Read,
-    out: &mut dyn Write,
-    blocksize: usize,
-) -> Result<InputState, Error> {
+fn transfer_block(inp: &mut dyn Read, out: &mut dyn Write, blocksize: usize) -> Result<InputState, Error> {
     let mut buffer = vec![0u8; blocksize];
 
     let mut readcount = 0usize;
-    let mut writecount = 0usize;
     while readcount < blocksize {
         let read = inp.read(&mut buffer[readcount..])?;
         if read == 0 {
             return Ok(InputState::Done);
         }
+        out.write_all(&buffer[readcount..readcount+read])?;
         readcount += read;
-
-        while readcount > writecount {
-            writecount += out.write(&buffer[writecount..readcount])?;
-        }
     }
     return Ok(InputState::More);
 }

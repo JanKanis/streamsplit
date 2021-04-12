@@ -130,6 +130,7 @@ name = "streamsplit"
 version = "0.1.0"
 dependencies = [
  "hex",
+ "libc",
  "once_cell",
  "structopt",
 ]

@@ -11,6 +11,8 @@ use once_cell::sync::Lazy;
 use structopt::StructOpt;
 use std::time::{Instant, Duration};
 use std::cmp::{min, max};
+use std::mem::size_of;
+use std::net::Shutdown;
 
 // The format! macro doesn't understand regular constants :(
 macro_rules! MERGE_SOCKET_NAME {
@@ -176,7 +178,7 @@ impl USize for u32 {
 
 impl Header {
     fn bytes(&self) -> Vec<u8> {
-        let mut res = Vec::with_capacity(std::mem::size_of::<Header>());
+        let mut res = Vec::with_capacity(size_of::<Header>());
         WriteChainer { slice: &mut res }
             .write(&self.magic)
             .write(&self.version.to_be_bytes())
@@ -189,8 +191,8 @@ impl Header {
         res
     }
 
-    fn read_from_stream(r: &mut dyn Read, errmsg: &str) -> Header {
-        let mut bytes = [0u8; std::mem::size_of::<Header>()];
+    fn read_from_stream(r: &mut dyn Read, errmsg: &str) -> (Header, [u8; size_of::<Header>()]) {
+        let mut bytes = [0u8; size_of::<Header>()];
         r.read(&mut bytes).expect("Unable to read header from stream");
         let mut hdr = Header::default();
 
@@ -218,7 +220,7 @@ impl Header {
             panic!("{}: The stream has a stream_id >= the number of splits, which is invalid", errmsg)
         }
 
-        hdr
+        (hdr, bytes)
     }
 }
 
@@ -269,12 +271,12 @@ fn main() {
 }
 
 fn merge(mut inp: Box<dyn Read>) {
-    let hdr = Header::read_from_stream(&mut inp, "Invalid input stream");
+    let (hdr, hdrbytes) = Header::read_from_stream(&mut inp, "Invalid input stream");
 
     if hdr.stream_id == 0 {
         merge_master(hdr, inp, Box::new(io::stdout()));
     } else {
-        // slave mergers
+        merge_slave(hdr, hdrbytes, inp);
     }
 }
 
@@ -306,7 +308,7 @@ fn merge_master(hdr: Header, mut inp: Box<dyn Read>, mut outp: Box<dyn Write>) {
     stream_opts[0] = Some(inp);
 
     if OPTS.verbose {
-        eprint!("1 of {} merge streams connected\r", hdr.splits);
+        eprintln!("Merge socket created. 1 of {} merge streams connected", hdr.splits);
     }
 
     // This process also counts for 1
@@ -320,7 +322,7 @@ fn merge_master(hdr: Header, mut inp: Box<dyn Read>, mut outp: Box<dyn Write>) {
                 continue;
             }
             Ok((mut stream, _addr)) => {
-                let streamhdr = Header::read_from_stream(&mut stream, "Invalid merge stream");
+                let (streamhdr, _) = Header::read_from_stream(&mut stream, "Invalid merge stream");
                 if streamhdr.streamsplit_id != hdr.streamsplit_id {
                     panic!("Invalid merge stream: stream set id does not match, a stream that is not part of this merge set appears to have connected");
                 }
@@ -337,13 +339,10 @@ fn merge_master(hdr: Header, mut inp: Box<dyn Read>, mut outp: Box<dyn Write>) {
                 stream_opts[streamhdr.stream_id.usize()] = Some(Box::new(stream));
                 connected_slaves += 1;
                 if OPTS.verbose {
-                    eprint!("{} of {} merge streams connected\r", connected_slaves, hdr.splits);
+                    eprintln!("{} of {} merge streams connected", connected_slaves, hdr.splits);
                 }
             }
         }
-    }
-    if OPTS.verbose {
-        eprintln!()
     }
 
     let mut streams: Vec<Box<dyn Read>> =
@@ -361,7 +360,11 @@ fn merge_master(hdr: Header, mut inp: Box<dyn Read>, mut outp: Box<dyn Write>) {
     check_all_eof(streams.as_mut_slice());
 }
 
-fn merge_slave(hdr: Header, mut inp: Box<dyn Read>) {
+fn merge_slave(hdr: Header, hdrbytes: [u8; size_of::<Header>()], mut inp: Box<dyn Read>) {
+    if OPTS.verbose {
+        eprintln!("slave merger #{} trying to connect...", hdr.stream_id);
+    }
+
     let socketpath = socket_path(&OPTS.socket_dir, &hdr.streamsplit_id);
 
     let deadline = Instant::now() + Duration::from_millis(u64::from(OPTS.timeout));
@@ -387,6 +390,12 @@ fn merge_slave(hdr: Header, mut inp: Box<dyn Read>) {
         }
     };
 
+    socket.write_all(&hdrbytes).expect("Error writing to merge socket");
+
+    if OPTS.verbose {
+        eprintln!("slave merger #{} connected", hdr.stream_id);
+    }
+
     let mut buf = vec![0u8; 64*1024];
     loop {
         let count = inp.read(&mut buf).expect("Error reading from stdin");
@@ -395,6 +404,8 @@ fn merge_slave(hdr: Header, mut inp: Box<dyn Read>) {
         }
         socket.write_all(&buf[..count]).expect("Error writing to merge socket");
     }
+
+    socket.shutdown(Shutdown::Both);
 }
 
 fn check_all_eof(readers: &mut [Box<dyn Read>]) {

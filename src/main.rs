@@ -21,6 +21,14 @@ macro_rules! MERGE_SOCKET_NAME {
     };
 }
 
+macro_rules! debug {
+    ($($arg:tt)*) => {
+        if OPTS.verbose {
+            eprintln!("{}", format!($($arg)*));
+        }
+    };
+}
+
 #[derive(Debug, Default, StructOpt)]
 #[structopt(name = "streamsplit", about = "Split a byte stream into multiple streams and merge them back")]
 struct Opt {
@@ -243,9 +251,7 @@ static OPTS: Lazy<Opt> = Lazy::new(|| Opt::from_args().init());
 
 fn main() {
     if let Some(splits) = OPTS.split {
-        if let Err(e) = split(splits, &OPTS.command) {
-            std::process::exit(1);
-        }
+        split(splits, &OPTS.command);
     }
 
     if OPTS.merge {
@@ -275,8 +281,10 @@ fn merge(mut inp: Box<dyn Read>) {
 
     if hdr.stream_id == 0 {
         merge_master(hdr, inp, Box::new(io::stdout()));
+        debug!("merge master exiting");
     } else {
         merge_slave(hdr, hdrbytes, inp);
+        debug!("merge slave #{} exiting", hdr.stream_id);
     }
 }
 
@@ -307,18 +315,14 @@ fn merge_master(hdr: Header, mut inp: Box<dyn Read>, mut outp: Box<dyn Write>) {
     }
     stream_opts[0] = Some(inp);
 
-    if OPTS.verbose {
-        eprintln!("Merge socket created. 1 of {} merge streams connected", hdr.splits);
-    }
+    debug!("Merge socket created. 1 of {} merge streams connected", hdr.splits);
 
     // This process also counts for 1
     let mut connected_slaves = 1;
     while connected_slaves < hdr.splits {
         match listener.accept() {
             Err(e) => {
-                if OPTS.verbose {
-                    eprintln!("Error listening on merge socket: {}", e)
-                }
+                eprintln!("Error listening on merge socket: {}", e);
                 continue;
             }
             Ok((mut stream, _addr)) => {
@@ -338,9 +342,7 @@ fn merge_master(hdr: Header, mut inp: Box<dyn Read>, mut outp: Box<dyn Write>) {
 
                 stream_opts[streamhdr.stream_id.usize()] = Some(Box::new(stream));
                 connected_slaves += 1;
-                if OPTS.verbose {
-                    eprintln!("{} of {} merge streams connected", connected_slaves, hdr.splits);
-                }
+                debug!("{} of {} merge streams connected", connected_slaves, hdr.splits);
             }
         }
     }
@@ -350,7 +352,7 @@ fn merge_master(hdr: Header, mut inp: Box<dyn Read>, mut outp: Box<dyn Write>) {
 
     'outer: loop {
         for i in 0..streams.len() {
-            let state = transfer_block(&mut *streams[i], &mut *outp, OPTS.blocksize.usize()).unwrap();
+            let state = transfer_block(&mut *streams[i], &mut *outp, hdr.blocksize.usize()).unwrap();
             if state == InputState::Done {
                 break 'outer;
             }
@@ -361,9 +363,7 @@ fn merge_master(hdr: Header, mut inp: Box<dyn Read>, mut outp: Box<dyn Write>) {
 }
 
 fn merge_slave(hdr: Header, hdrbytes: [u8; size_of::<Header>()], mut inp: Box<dyn Read>) {
-    if OPTS.verbose {
-        eprintln!("slave merger #{} trying to connect...", hdr.stream_id);
-    }
+    debug!("slave merger #{} trying to connect...", hdr.stream_id);
 
     let socketpath = socket_path(&OPTS.socket_dir, &hdr.streamsplit_id);
 
@@ -392,15 +392,14 @@ fn merge_slave(hdr: Header, hdrbytes: [u8; size_of::<Header>()], mut inp: Box<dy
 
     socket.write_all(&hdrbytes).expect("Error writing to merge socket");
 
-    if OPTS.verbose {
-        eprintln!("slave merger #{} connected", hdr.stream_id);
-    }
+    debug!("slave merger #{} connected", hdr.stream_id);
 
     let mut buf = vec![0u8; 64*1024];
     loop {
         let count = inp.read(&mut buf).expect("Error reading from stdin");
+        debug!("slave merger: read {} bytes", count);
         if count == 0 {
-            continue  // EOF
+            break  // EOF
         }
         socket.write_all(&buf[..count]).expect("Error writing to merge socket");
     }
@@ -434,23 +433,22 @@ fn random() -> [u8; 16] {
     buf
 }
 
-fn split(num: u16, command: &Vec<String>) -> Result<(), Error> {
+fn split(num: u16, command: &Vec<String>) {
     let mut children = Vec::<Child>::with_capacity(num.usize());
 
     let mut header = Header::default();
     header.blocksize = OPTS.blocksize;
     header.splits = num;
     header.streamsplit_id = random();
-    if OPTS.verbose {
-        eprintln!("Instance id: {}", hex::encode(header.streamsplit_id));
-    }
+    debug!("Instance id: {}", hex::encode(header.streamsplit_id));
 
     for i in 0..num {
         let child = Command::new(&command[0])
             .stdin(Stdio::piped())
             .env("STREAMSPLIT_N", (i + 1).to_string())
             .args(&command[1..])
-            .spawn()?;
+            .spawn()
+            .expect("Unable to start child process");
 
         header.stream_id = i;
         if !OPTS.no_header {
@@ -462,6 +460,7 @@ fn split(num: u16, command: &Vec<String>) -> Result<(), Error> {
                 .expect("Error writing header to output");
         }
         children.push(child);
+        debug!("Splitter child {} started", i);
     }
 
     let mut current_child = 0u16;
@@ -480,6 +479,12 @@ fn split(num: u16, command: &Vec<String>) -> Result<(), Error> {
         current_child = (current_child + 1) % num;
     }
 
+    debug!("Splitter input finished, closing children");
+
+    for mut child in children.iter_mut() {
+        drop(child.stdin.take());
+    }
+
     let mut failure = false;
     for (i, mut child) in children.iter_mut().enumerate() {
         let status = child.wait().unwrap_or_else(|e| {
@@ -489,14 +494,14 @@ fn split(num: u16, command: &Vec<String>) -> Result<(), Error> {
             eprintln!("Error: Child {} exited with status {}", i, status.code().unwrap());
             failure = true;
         }
+        debug!("Splitter child {} exited", i);
     }
     if failure {
-        return Err(Error::from(ErrorKind::Other));
+        panic!("Child process exited with error");
     }
 
     children.clear();
-
-    return Ok(());
+    debug!("splitter exiting");
 }
 
 fn transfer_block(inp: &mut dyn Read, out: &mut dyn Write, blocksize: usize) -> Result<InputState, Error> {

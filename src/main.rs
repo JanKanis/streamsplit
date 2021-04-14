@@ -1,19 +1,24 @@
+use std::cmp::min;
 use std::convert::{TryFrom, TryInto};
 use std::fmt::{Display, Formatter};
 use std::fs::File;
 use std::io::{self, Error, ErrorKind, Read, Write};
+use std::mem::size_of;
+use std::os::unix::io::AsRawFd;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::thread::sleep;
+use std::time::{Duration, Instant};
 
 use hex;
 use once_cell::sync::Lazy;
 use structopt::StructOpt;
-use std::time::{Instant, Duration};
-use std::cmp::{min, max};
-use std::mem::size_of;
-use std::net::Shutdown;
 
+use syscall_wrappers::*;
+use syscall_wrappers::UnixCalls;
+
+mod syscall_wrappers;
 // The format! macro doesn't understand regular constants :(
 macro_rules! MERGE_SOCKET_NAME {
     () => {
@@ -24,7 +29,8 @@ macro_rules! MERGE_SOCKET_NAME {
 macro_rules! debug {
     ($($arg:tt)*) => {
         if OPTS.verbose {
-            eprintln!("{}", format!($($arg)*));
+            // ensure output is written in a single write, to avoid mixing up writes from different processes
+            eprint!("{}", format_args!("{}\n", format_args!($($arg)*)));
         }
     };
 }
@@ -47,8 +53,8 @@ struct Opt {
     no_header: bool,
 
     /// The block size in which to split the datastream. A linux pipe by default has a buffer of
-    /// 16 KB, so a larger block size is probably not useful.
-    #[structopt(short, long, default_value = "16384")]
+    /// 64 KB, and using that as block size appears to be optimal if the data goes through a pipe.
+    #[structopt(short, long, default_value = "65536")]
     blocksize: u32,
 
     /// The shell used to interpret commands. Defaults to the user's default shell in $SHELL.
@@ -57,20 +63,25 @@ struct Opt {
 
     /// Do not interpret the command as a shell command, but run it directly
     #[structopt(long, short, conflicts_with = "sh")]
-    no_shell: bool,
+    no_sh: bool,
 
     /// timeout when waiting for the master merge socket to appear
     #[structopt(short, long, default_value = "5000")]
     timeout: u32,
 
-    /// The time to wait after closing output streams of the non-leading merge processes
-    #[structopt(short, long, default_value = "1000")]
+    /// The time in ms to wait after closing output streams of the non-leading merge processes,
+    /// to prevent a pipeline on a merge slave's stdout from messing up the pipeline on the merge master.
+    #[structopt(short, long, default_value = "5")]
     pause_after_close: u32,
 
     /// Output file for the merged stream. If not used, the merged stream will be written to the
     /// leading process's stdout.
     #[structopt(short, long)]
     output: Option<String>,
+
+    /// input file. If not specified, stdin is used
+    #[structopt(short,long)]
+    input: Option<String>,
 
     /// The directory to create the merging socket. Defaults to $XDG_RUNTIME_DIR or /tmp if that is not set.
     #[structopt(long, env = "XDG_RUNTIME_DIR", default_value = "/tmp")]
@@ -247,7 +258,7 @@ impl Default for Header {
 }
 
 static OPTS: Lazy<Opt> = Lazy::new(|| Opt::from_args().init());
-//static OPTS: OnceCell<Opt> = OnceCell::new();
+static STDIN: Lazy<io::Stdin> = Lazy::new(|| io::stdin());
 
 fn main() {
     if let Some(splits) = OPTS.split {
@@ -255,7 +266,7 @@ fn main() {
     }
 
     if OPTS.merge {
-        merge(Box::new(io::stdin()));
+        merge(Box::new(STDIN.lock()));
     }
     return;
 
@@ -279,8 +290,26 @@ fn main() {
 fn merge(mut inp: Box<dyn Read>) {
     let (hdr, hdrbytes) = Header::read_from_stream(&mut inp, "Invalid input stream");
 
+    let mut file: Box<dyn Write>;
     if hdr.stream_id == 0 {
-        merge_master(hdr, inp, Box::new(io::stdout()));
+        let mut cmd;
+        let out: &mut dyn Write = match OPTS.output.as_ref().map(String::as_str) {
+            None => {
+                cmd = command(&OPTS.command)
+                    .stdin(Stdio::piped()).spawn().expect("Unable to start child process");
+                cmd.stdin.as_mut().unwrap()
+            },
+            Some("-") => {
+                file = Box::new(io::stdout());
+                &mut file
+            },
+            Some(f) => {
+                file = Box::new(File::open(f).expect(&format!("Error opening {}", f)));
+                &mut file
+            },
+        };
+
+        merge_master(hdr, inp, out);
         debug!("merge master exiting");
     } else {
         merge_slave(hdr, hdrbytes, inp);
@@ -294,28 +323,28 @@ struct FileDeleter<'a> {
 impl Drop for FileDeleter<'_> {
     fn drop(&mut self) {
         if let Err(e) = std::fs::remove_file(self.path) {
-            eprintln!("Deleting listening socket at {} failed", self.path.to_string_lossy());
+            eprintln!("Deleting listening socket at {} failed: {:?}", self.path.to_string_lossy(), e);
         };
     }
 }
 
-fn merge_master(hdr: Header, mut inp: Box<dyn Read>, mut outp: Box<dyn Write>) {
+fn merge_master(hdr: Header, inp: Box<dyn Read>, outp: &mut dyn Write) {
     // Set umask so only this user has access to the socket, just to be safe
-    let old_umask = unsafe { libc::umask(0o177) };
+    let old_umask = umask(0o177);
     let socketpath = socket_path(&OPTS.socket_dir, &hdr.streamsplit_id);
     let listener = UnixListener::bind(socketpath.as_path()).unwrap_or_else(|e| {
         panic!("Unable to create socket at {}: {:?}", socketpath.as_path().to_string_lossy(), e)
     });
-    unsafe { libc::umask(old_umask) };
-    let deleter = FileDeleter { path: &socketpath };
+    umask(old_umask);
+    let _deleter = FileDeleter { path: &socketpath };
 
     let mut stream_opts = Vec::with_capacity(hdr.splits.usize());
-    for i in 0..stream_opts.capacity() {
+    for _ in 0..stream_opts.capacity() {
         stream_opts.push(None);
     }
     stream_opts[0] = Some(inp);
 
-    debug!("Merge socket created. 1 of {} merge streams connected", hdr.splits);
+    debug!("Merge master: socket created. 1 of {} merge streams connected", hdr.splits);
 
     // This process also counts for 1
     let mut connected_slaves = 1;
@@ -342,13 +371,14 @@ fn merge_master(hdr: Header, mut inp: Box<dyn Read>, mut outp: Box<dyn Write>) {
 
                 stream_opts[streamhdr.stream_id.usize()] = Some(Box::new(stream));
                 connected_slaves += 1;
-                debug!("{} of {} merge streams connected", connected_slaves, hdr.splits);
+                debug!("Merge master: {} of {} merge streams connected", connected_slaves, hdr.splits);
             }
         }
     }
 
-    let mut streams: Vec<Box<dyn Read>> =
-        stream_opts.into_iter().map(|s| s.unwrap()).collect();
+    let mut streams: Vec<Box<dyn Read>> = stream_opts.into_iter().map(|s| s.unwrap()).collect();
+
+    sleep(Duration::from_millis(u64::from(OPTS.pause_after_close)));
 
     'outer: loop {
         for i in 0..streams.len() {
@@ -375,7 +405,7 @@ fn merge_slave(hdr: Header, hdrbytes: [u8; size_of::<Header>()], mut inp: Box<dy
     let mut socket = loop {
         let conn = UnixStream::connect(&socketpath);
         match conn {
-            Ok(socket) => { break socket }
+            Ok(socket) => break socket,
             Err(e) => {
                 if e.kind() != ErrorKind::NotFound {
                     panic!("Error connecting to merge master process: {:?}", e);
@@ -383,33 +413,36 @@ fn merge_slave(hdr: Header, hdrbytes: [u8; size_of::<Header>()], mut inp: Box<dy
                     panic!("Timeout exceeded while trying to connect to merge master");
                 } else {
                     std::thread::sleep(interval);
-                    interval = min(interval * 2, Duration::from_millis(300)) ;
-                    continue
+                    interval = min(interval * 2, Duration::from_millis(300));
+                    continue;
                 }
             }
         }
     };
 
+    // Close stdout to let any pipelined processes exit, they should only keep running from the merge master
+    io::stdout().close().expect("Closing stdout failed");
+
     socket.write_all(&hdrbytes).expect("Error writing to merge socket");
 
     debug!("slave merger #{} connected", hdr.stream_id);
 
-    let mut buf = vec![0u8; 64*1024];
+    let mut buf = vec![0u8; 64 * 1024];
     loop {
         let count = inp.read(&mut buf).expect("Error reading from stdin");
-        debug!("slave merger: read {} bytes", count);
+        debug!("slave merger #{}: read {} bytes", hdr.stream_id, count);
         if count == 0 {
-            break  // EOF
+            break; // EOF
         }
         socket.write_all(&buf[..count]).expect("Error writing to merge socket");
     }
 
-    socket.shutdown(Shutdown::Both);
+    socket.close().expect("Closing socket failed");
 }
 
 fn check_all_eof(readers: &mut [Box<dyn Read>]) {
     let mut buf = [0u8; 1];
-    for mut r in readers.iter_mut() {
+    for r in readers.iter_mut() {
         let count = r.read(&mut buf).unwrap();
         if count != 0 {
             panic!(
@@ -433,7 +466,18 @@ fn random() -> [u8; 16] {
     buf
 }
 
-fn split(num: u16, command: &Vec<String>) {
+fn split(num: u16, cmd: &Vec<String>) {
+    let mut inp: &mut dyn Read = &mut STDIN.lock();
+    let mut infile;
+    match &OPTS.input.as_ref().map(|s| s.as_str()) {
+        None => {}
+        Some("-") => {}
+        Some(path) => {
+            infile = File::open(path).expect("unable to open input file");
+            inp = &mut infile;
+        }
+    }
+
     let mut children = Vec::<Child>::with_capacity(num.usize());
 
     let mut header = Header::default();
@@ -443,10 +487,9 @@ fn split(num: u16, command: &Vec<String>) {
     debug!("Instance id: {}", hex::encode(header.streamsplit_id));
 
     for i in 0..num {
-        let child = Command::new(&command[0])
+        let child = command(&cmd)
             .stdin(Stdio::piped())
             .env("STREAMSPLIT_N", (i + 1).to_string())
-            .args(&command[1..])
             .spawn()
             .expect("Unable to start child process");
 
@@ -456,7 +499,7 @@ fn split(num: u16, command: &Vec<String>) {
                 .stdin
                 .as_ref()
                 .unwrap()
-                .write(header.bytes().as_slice())
+                .write_all(header.bytes().as_slice())
                 .expect("Error writing header to output");
         }
         children.push(child);
@@ -467,7 +510,7 @@ fn split(num: u16, command: &Vec<String>) {
 
     loop {
         let inputstate = transfer_block(
-            &mut io::stdin(),
+            &mut inp,
             &mut children[current_child.usize()].stdin.as_ref().unwrap(),
             OPTS.blocksize.usize(),
         )
@@ -481,12 +524,12 @@ fn split(num: u16, command: &Vec<String>) {
 
     debug!("Splitter input finished, closing children");
 
-    for mut child in children.iter_mut() {
+    for child in children.iter_mut() {
         drop(child.stdin.take());
     }
 
     let mut failure = false;
-    for (i, mut child) in children.iter_mut().enumerate() {
+    for (i, child) in children.iter_mut().enumerate() {
         let status = child.wait().unwrap_or_else(|e| {
             panic!("Error waiting on child {}: {:?}", i, e);
         });
@@ -504,6 +547,20 @@ fn split(num: u16, command: &Vec<String>) {
     debug!("splitter exiting");
 }
 
+fn command(cmd: &[String]) -> Command {
+    if OPTS.no_sh {
+        let mut com = Command::new(&cmd[0]);
+        com.args(&cmd[1..]);
+        return com;
+    } else {
+        let shellcmd = cmd.join(" ");
+        let mut com = Command::new(&OPTS.sh);
+        com.arg("-c");
+        com.arg(shellcmd);
+        return com;
+    }
+}
+
 fn transfer_block(inp: &mut dyn Read, out: &mut dyn Write, blocksize: usize) -> Result<InputState, Error> {
     let mut buffer = vec![0u8; blocksize];
 
@@ -513,7 +570,7 @@ fn transfer_block(inp: &mut dyn Read, out: &mut dyn Write, blocksize: usize) -> 
         if read == 0 {
             return Ok(InputState::Done);
         }
-        out.write_all(&buffer[readcount..readcount+read])?;
+        out.write_all(&buffer[readcount..readcount + read])?;
         readcount += read;
     }
     return Ok(InputState::More);

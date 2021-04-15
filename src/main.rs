@@ -262,11 +262,12 @@ static STDIN: Lazy<io::Stdin> = Lazy::new(|| io::stdin());
 
 fn main() {
     if let Some(splits) = OPTS.split {
-        split(splits, &OPTS.command);
+        split(splits);
     }
 
     if OPTS.merge {
-        merge(Box::new(STDIN.lock()));
+        let stdin = io::stdin();
+        merge(Box::new(stdin.lock()));
     }
     return;
 
@@ -287,7 +288,7 @@ fn main() {
     }
 }
 
-fn merge(mut inp: Box<dyn Read>) {
+fn merge<'a>(mut inp: Box<dyn Read + 'a>) {
     let (hdr, hdrbytes) = Header::read_from_stream(&mut inp, "Invalid input stream");
 
     let mut file: Box<dyn Write>;
@@ -328,7 +329,7 @@ impl Drop for FileDeleter<'_> {
     }
 }
 
-fn merge_master(hdr: Header, inp: Box<dyn Read>, outp: &mut dyn Write) {
+fn merge_master<'a>(hdr: Header, inp: Box<dyn Read + 'a>, outp: &mut dyn Write) {
     // Set umask so only this user has access to the socket, just to be safe
     let old_umask = umask(0o177);
     let socketpath = socket_path(&OPTS.socket_dir, &hdr.streamsplit_id);
@@ -338,11 +339,11 @@ fn merge_master(hdr: Header, inp: Box<dyn Read>, outp: &mut dyn Write) {
     umask(old_umask);
     let _deleter = FileDeleter { path: &socketpath };
 
-    let mut stream_opts = Vec::with_capacity(hdr.splits.usize());
-    for _ in 0..stream_opts.capacity() {
-        stream_opts.push(None);
-    }
-    stream_opts[0] = Some(inp);
+    let mut streams: Vec<Box<dyn Read + 'a>> = Vec::with_capacity(hdr.splits.usize());
+    // for _ in 0..stream_opts.capacity() {
+    //     stream_opts.push(None);
+    // }
+    streams[0] = inp;
 
     debug!("Merge master: socket created. 1 of {} merge streams connected", hdr.splits);
 
@@ -369,14 +370,14 @@ fn merge_master(hdr: Header, inp: Box<dyn Read>, outp: &mut dyn Write) {
                     panic!("Invalid merge stream: connecting stream has stream id 0, which is invalid")
                 }
 
-                stream_opts[streamhdr.stream_id.usize()] = Some(Box::new(stream));
+                streams[streamhdr.stream_id.usize()] = Box::new(stream);
                 connected_slaves += 1;
                 debug!("Merge master: {} of {} merge streams connected", connected_slaves, hdr.splits);
             }
         }
     }
 
-    let mut streams: Vec<Box<dyn Read>> = stream_opts.into_iter().map(|s| s.unwrap()).collect();
+//    let mut streams: Vec<Box<dyn Read>> = stream_opts.into_iter().map(|s| s.unwrap).collect();
 
     sleep(Duration::from_millis(u64::from(OPTS.pause_after_close)));
 
@@ -392,7 +393,7 @@ fn merge_master(hdr: Header, inp: Box<dyn Read>, outp: &mut dyn Write) {
     check_all_eof(streams.as_mut_slice());
 }
 
-fn merge_slave(hdr: Header, hdrbytes: [u8; size_of::<Header>()], mut inp: Box<dyn Read>) {
+fn merge_slave<'a>(hdr: Header, hdrbytes: [u8; size_of::<Header>()], mut inp: Box<dyn Read + 'a>) {
     debug!("slave merger #{} trying to connect...", hdr.stream_id);
 
     let socketpath = socket_path(&OPTS.socket_dir, &hdr.streamsplit_id);
@@ -440,7 +441,7 @@ fn merge_slave(hdr: Header, hdrbytes: [u8; size_of::<Header>()], mut inp: Box<dy
     socket.close().expect("Closing socket failed");
 }
 
-fn check_all_eof(readers: &mut [Box<dyn Read>]) {
+fn check_all_eof<'a>(readers: &mut [Box<dyn Read + 'a>]) {
     let mut buf = [0u8; 1];
     for r in readers.iter_mut() {
         let count = r.read(&mut buf).unwrap();
@@ -466,7 +467,7 @@ fn random() -> [u8; 16] {
     buf
 }
 
-fn split(num: u16, cmd: &Vec<String>) {
+fn split(num: u16) {
     let mut inp: &mut dyn Read = &mut STDIN.lock();
     let mut infile;
     match &OPTS.input.as_ref().map(|s| s.as_str()) {
@@ -487,7 +488,7 @@ fn split(num: u16, cmd: &Vec<String>) {
     debug!("Instance id: {}", hex::encode(header.streamsplit_id));
 
     for i in 0..num {
-        let child = command(&cmd)
+        let child = command(&OPTS.command)
             .stdin(Stdio::piped())
             .env("STREAMSPLIT_N", (i + 1).to_string())
             .spawn()

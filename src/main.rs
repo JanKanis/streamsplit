@@ -203,7 +203,7 @@ impl Header {
         res
     }
 
-    fn read_from_stream(r: &mut dyn Read, errmsg: &str) -> (Header, [u8; size_of::<Header>()]) {
+    fn read_from_stream(mut r: SSRawFd, errmsg: &str) -> (Header, [u8; size_of::<Header>()]) {
         let mut bytes = [0u8; size_of::<Header>()];
         r.read(&mut bytes).expect("Unable to read header from stream");
         let mut hdr = Header::default();
@@ -251,7 +251,7 @@ impl Default for Header {
 }
 
 /// Verifies that all readers are at EOF
-fn check_all_eof<'a>(readers: &mut [&mut dyn Read]) {
+fn check_all_eof<'a>(readers: &mut [SSRawFd]) {
     let mut buf = [0u8; 1];
     for r in readers {
         let count = r.read(&mut buf).unwrap();
@@ -303,23 +303,24 @@ fn main() {
 
     if OPTS.merge {
         // The file descriptor for stdin will stay open, despite dropping the stdin object
-        merge(&mut io::stdin().as_ssrawfd());
+        merge(io::stdin().as_ssrawfd());
     }
 }
 
 fn split(num: u16) {
-    let mut inp: &mut dyn Read = &mut io::stdin().as_ssrawfd();
-    let mut infile;
+    let mut inp = io::stdin().as_ssrawfd();
+    let infile;
     match &OPTS.input.as_ref().map(|s| s.as_str()) {
         None => {}
         Some("-") => {}
         Some(path) => {
             infile = File::open(path).expect("unable to open input file");
-            inp = &mut infile;
+            inp = infile.as_ssrawfd();
         }
     }
 
     let mut children = Vec::<Child>::with_capacity(num.usize());
+    let mut children_fds = Vec::with_capacity(num.usize());
 
     let mut header = Header::default();
     header.blocksize = OPTS.blocksize;
@@ -335,32 +336,23 @@ fn split(num: u16) {
             .expect("Unable to start child process");
 
         header.stream_id = i;
+
+        let mut fd = child.stdin.as_ref().unwrap().as_ssrawfd();
         if !OPTS.no_header {
-            child
-                .stdin
-                .as_ref()
-                .unwrap()
-                .write_all(header.bytes().as_slice())
-                .expect("Error writing header to output");
+            fd.write_all(header.bytes().as_slice()).expect("Error writing header to output");
         }
         children.push(child);
+        children_fds.push(fd);
         debug!("Splitter child {} started", i);
     }
 
-    let mut current_child = 0u16;
-
-    loop {
-        let inputstate = transfer_block(
-            &mut inp,
-            &mut children[current_child.usize()].stdin.as_ref().unwrap(),
-            OPTS.blocksize.usize(),
-        )
-            .unwrap();
-        if inputstate == InputState::Done {
-            break;
+    'outer: loop {
+        for i in 0..children.len() {
+            let inputstate = transfer_block(inp, children_fds[i], OPTS.blocksize.usize()).unwrap();
+            if inputstate == InputState::Done {
+                break 'outer;
+            }
         }
-
-        current_child = (current_child + 1) % num;
     }
 
     debug!("Splitter input finished, closing children");
@@ -388,27 +380,26 @@ fn split(num: u16) {
     debug!("splitter exiting");
 }
 
-fn merge(inp: &mut dyn Read) {
+fn merge(inp: SSRawFd) {
     let (hdr, hdrbytes) = Header::read_from_stream(inp, "Invalid input stream");
 
-    let mut file: Box<dyn Write>;
+    let file: File;
     if hdr.stream_id == 0 {
         let mut cmd;
-        let out: &mut dyn Write = match OPTS.output.as_ref().map(String::as_str) {
+        let out = match OPTS.output.as_ref().map(String::as_str) {
             None => {
                 cmd = command(&OPTS.command)
                     .stdin(Stdio::piped())
                     .spawn()
                     .expect("Unable to start child process");
-                cmd.stdin.as_mut().unwrap()
+                cmd.stdin.as_mut().unwrap().as_ssrawfd()
             }
             Some("-") => {
-                file = Box::new(io::stdout());
-                &mut file
+                io::stdout().as_ssrawfd()
             }
             Some(f) => {
-                file = Box::new(File::open(f).expect(&format!("Error opening {}", f)));
-                &mut file
+                file = File::open(f).expect(&format!("Error opening {}", f));
+                file.as_ssrawfd()
             }
         };
 
@@ -420,7 +411,7 @@ fn merge(inp: &mut dyn Read) {
     }
 }
 
-fn merge_master<'a>(hdr: Header, inp: &mut dyn Read, outp: &mut dyn Write) {
+fn merge_master(hdr: Header, inp: SSRawFd, outp: SSRawFd) {
     // Set umask so only this user has access to the socket, just to be safe
     let old_umask = umask(0o177);
     let socketpath = socket_path(&OPTS.socket_dir, &hdr.streamsplit_id);
@@ -444,8 +435,8 @@ fn merge_master<'a>(hdr: Header, inp: &mut dyn Read, outp: &mut dyn Write) {
                 eprintln!("Error listening on merge socket: {}", e);
                 continue;
             }
-            Ok((mut stream, _addr)) => {
-                let (streamhdr, _) = Header::read_from_stream(&mut stream, "Invalid merge stream");
+            Ok((stream, _addr)) => {
+                let (streamhdr, _) = Header::read_from_stream(stream.as_ssrawfd(), "Invalid merge stream");
                 if streamhdr.streamsplit_id != hdr.streamsplit_id {
                     panic!("Invalid merge stream: stream set id does not match, a stream that is not part of this merge set appears to have connected");
                 }
@@ -475,15 +466,15 @@ fn merge_master<'a>(hdr: Header, inp: &mut dyn Read, outp: &mut dyn Write) {
     drop(deleter);
 
     //let mut streams: Vec<Box<dyn Read>> = stream_opts.into_iter().map(|s| s.unwrap()).collect();
-    let mut streams: Vec<&mut dyn Read> = Vec::with_capacity(hdr.splits.usize());
+    let mut streams: Vec<SSRawFd> = Vec::with_capacity(hdr.splits.usize());
     streams.push(inp);
-    streams.extend(sockets.iter_mut().map(|s| -> &mut dyn Read { s.as_mut().unwrap() }));
+    streams.extend(sockets.iter().map(|s| s.as_ref().unwrap().as_ssrawfd()));
 
     sleep(Duration::from_millis(u64::from(OPTS.pause_after_close)));
 
     'outer: loop {
         for i in 0..streams.len() {
-            let state = transfer_block(streams[i], &mut *outp, hdr.blocksize.usize()).unwrap();
+            let state = transfer_block(streams[i], outp, hdr.blocksize.usize()).unwrap();
             if state == InputState::Done {
                 break 'outer;
             }
@@ -493,7 +484,7 @@ fn merge_master<'a>(hdr: Header, inp: &mut dyn Read, outp: &mut dyn Write) {
     check_all_eof(streams.as_mut_slice());
 }
 
-fn merge_slave(hdr: Header, hdrbytes: [u8; size_of::<Header>()], inp: &mut dyn Read) {
+fn merge_slave(hdr: Header, hdrbytes: [u8; size_of::<Header>()], mut inp: SSRawFd) {
     debug!("slave merger #{} trying to connect...", hdr.stream_id);
 
     let socketpath = socket_path(&OPTS.socket_dir, &hdr.streamsplit_id);
@@ -503,7 +494,7 @@ fn merge_slave(hdr: Header, hdrbytes: [u8; size_of::<Header>()], inp: &mut dyn R
     let mut interval = Duration::from_millis(1);
 
     // Connect to the merge master's socket, give the master some time to create it but don't wait forever
-    let mut socket = loop {
+    let socketobj = loop {
         let conn = UnixStream::connect(&socketpath);
         match conn {
             Ok(socket) => break socket,
@@ -520,6 +511,7 @@ fn merge_slave(hdr: Header, hdrbytes: [u8; size_of::<Header>()], inp: &mut dyn R
             }
         }
     };
+    let mut socket = socketobj.as_ssrawfd();
 
     // Close stdout to let any pipelined processes exit, they should only keep running from the merge master
     io::stdout().as_ssrawfd().close().expect("Closing stdout failed");
@@ -538,7 +530,7 @@ fn merge_slave(hdr: Header, hdrbytes: [u8; size_of::<Header>()], inp: &mut dyn R
     }
 }
 
-fn transfer_block(inp: &mut dyn Read, out: &mut dyn Write, blocksize: usize) -> Result<InputState, Error> {
+fn transfer_block(mut inp: SSRawFd, mut out: SSRawFd, blocksize: usize) -> Result<InputState, Error> {
     let mut buffer = vec![0u8; blocksize];
 
     let mut readcount = 0usize;

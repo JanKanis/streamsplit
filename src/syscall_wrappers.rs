@@ -28,6 +28,7 @@ pub fn umask(mask: libc::mode_t) -> libc::mode_t {
 }
 
 #[repr(transparent)]
+#[derive(Copy, Clone)]
 pub struct SSRawFd(RawFd);
 
 impl SSRawFd {

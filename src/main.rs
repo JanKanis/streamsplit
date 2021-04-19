@@ -2,16 +2,13 @@ mod syscall_wrappers;
 
 use std::cmp::min;
 use std::convert::{TryFrom, TryInto};
-use std::fmt::{Display, Formatter};
 use std::fs::File;
 use std::io::{self, Error, ErrorKind, Read, Write};
-use std::iter::Map;
 use std::mem::replace;
 use std::mem::size_of;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::slice::IterMut;
 use std::thread::sleep;
 use std::time::{Duration, Instant};
 
@@ -310,6 +307,87 @@ fn main() {
     }
 }
 
+fn split(num: u16) {
+    let mut inp: &mut dyn Read = &mut io::stdin().as_ssrawfd();
+    let mut infile;
+    match &OPTS.input.as_ref().map(|s| s.as_str()) {
+        None => {}
+        Some("-") => {}
+        Some(path) => {
+            infile = File::open(path).expect("unable to open input file");
+            inp = &mut infile;
+        }
+    }
+
+    let mut children = Vec::<Child>::with_capacity(num.usize());
+
+    let mut header = Header::default();
+    header.blocksize = OPTS.blocksize;
+    header.splits = num;
+    header.streamsplit_id = random();
+    debug!("Instance id: {}", hex::encode(header.streamsplit_id));
+
+    for i in 0..num {
+        let child = command(&OPTS.command)
+            .stdin(Stdio::piped())
+            .env("STREAMSPLIT_N", i.to_string())
+            .spawn()
+            .expect("Unable to start child process");
+
+        header.stream_id = i;
+        if !OPTS.no_header {
+            child
+                .stdin
+                .as_ref()
+                .unwrap()
+                .write_all(header.bytes().as_slice())
+                .expect("Error writing header to output");
+        }
+        children.push(child);
+        debug!("Splitter child {} started", i);
+    }
+
+    let mut current_child = 0u16;
+
+    loop {
+        let inputstate = transfer_block(
+            &mut inp,
+            &mut children[current_child.usize()].stdin.as_ref().unwrap(),
+            OPTS.blocksize.usize(),
+        )
+            .unwrap();
+        if inputstate == InputState::Done {
+            break;
+        }
+
+        current_child = (current_child + 1) % num;
+    }
+
+    debug!("Splitter input finished, closing children");
+
+    for child in children.iter_mut() {
+        drop(child.stdin.take());
+    }
+
+    let mut failure = false;
+    for (i, child) in children.iter_mut().enumerate() {
+        let status = child.wait().unwrap_or_else(|e| {
+            panic!("Error waiting on child {}: {:?}", i, e);
+        });
+        if !status.success() {
+            eprintln!("Error: Child {} exited with status {}", i, status.code().unwrap());
+            failure = true;
+        }
+        debug!("Splitter child {} exited", i);
+    }
+    if failure {
+        panic!("Child process exited with error");
+    }
+
+    children.clear();
+    debug!("splitter exiting");
+}
+
 fn merge(inp: &mut dyn Read) {
     let (hdr, hdrbytes) = Header::read_from_stream(inp, "Invalid input stream");
 
@@ -458,87 +536,6 @@ fn merge_slave(hdr: Header, hdrbytes: [u8; size_of::<Header>()], inp: &mut dyn R
         }
         socket.write_all(&buf[..count]).expect("Error writing to merge socket");
     }
-}
-
-fn split(num: u16) {
-    let mut inp: &mut dyn Read = &mut io::stdin().as_ssrawfd();
-    let mut infile;
-    match &OPTS.input.as_ref().map(|s| s.as_str()) {
-        None => {}
-        Some("-") => {}
-        Some(path) => {
-            infile = File::open(path).expect("unable to open input file");
-            inp = &mut infile;
-        }
-    }
-
-    let mut children = Vec::<Child>::with_capacity(num.usize());
-
-    let mut header = Header::default();
-    header.blocksize = OPTS.blocksize;
-    header.splits = num;
-    header.streamsplit_id = random();
-    debug!("Instance id: {}", hex::encode(header.streamsplit_id));
-
-    for i in 0..num {
-        let child = command(&OPTS.command)
-            .stdin(Stdio::piped())
-            .env("STREAMSPLIT_N", i.to_string())
-            .spawn()
-            .expect("Unable to start child process");
-
-        header.stream_id = i;
-        if !OPTS.no_header {
-            child
-                .stdin
-                .as_ref()
-                .unwrap()
-                .write_all(header.bytes().as_slice())
-                .expect("Error writing header to output");
-        }
-        children.push(child);
-        debug!("Splitter child {} started", i);
-    }
-
-    let mut current_child = 0u16;
-
-    loop {
-        let inputstate = transfer_block(
-            &mut inp,
-            &mut children[current_child.usize()].stdin.as_ref().unwrap(),
-            OPTS.blocksize.usize(),
-        )
-        .unwrap();
-        if inputstate == InputState::Done {
-            break;
-        }
-
-        current_child = (current_child + 1) % num;
-    }
-
-    debug!("Splitter input finished, closing children");
-
-    for child in children.iter_mut() {
-        drop(child.stdin.take());
-    }
-
-    let mut failure = false;
-    for (i, child) in children.iter_mut().enumerate() {
-        let status = child.wait().unwrap_or_else(|e| {
-            panic!("Error waiting on child {}: {:?}", i, e);
-        });
-        if !status.success() {
-            eprintln!("Error: Child {} exited with status {}", i, status.code().unwrap());
-            failure = true;
-        }
-        debug!("Splitter child {} exited", i);
-    }
-    if failure {
-        panic!("Child process exited with error");
-    }
-
-    children.clear();
-    debug!("splitter exiting");
 }
 
 fn transfer_block(inp: &mut dyn Read, out: &mut dyn Write, blocksize: usize) -> Result<InputState, Error> {

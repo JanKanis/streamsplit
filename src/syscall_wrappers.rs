@@ -1,11 +1,11 @@
 use libc;
-use libc::{c_void, ssize_t, size_t};
+use libc::{c_void, size_t, ssize_t};
+use num_traits::One;
 use std::convert::TryFrom;
-use std::io::{Error, Result, Read, Write};
-use std::os::raw::{c_int};
-use std::os::unix::io::{AsRawFd, RawFd};
-use num_traits::{Num, One};
+use std::io::{Error, Read, Result, Write};
 use std::ops::Neg;
+use std::os::raw::c_int;
+use std::os::unix::io::{AsRawFd, RawFd};
 
 fn cvt<N: Eq + Neg<Output = N> + One>(t: N) -> Result<N> {
     if t == -N::one() {
@@ -27,50 +27,38 @@ pub fn umask(mask: libc::mode_t) -> libc::mode_t {
     return unsafe { libc::umask(mask) };
 }
 
-pub trait UnixCalls: AsRawFd {
-    fn close(&self) -> Result<c_int>;
-}
+#[repr(transparent)]
+pub struct SSRawFd(RawFd);
 
-impl<T: AsRawFd> UnixCalls for T {
-    fn close(&self) -> Result<c_int> {
-        cvt(unsafe { libc::close(self.as_raw_fd()) })
+impl SSRawFd {
+    pub fn close(&self) -> Result<c_int> {
+        cvt(unsafe { libc::close(self.0) })
     }
 }
 
-pub trait SSRawFd {
-    fn to_c_int(&self) -> c_int;
-    fn read(&mut self, buf: &mut [u8]) -> Result<usize>;
-    fn write(&mut self, buf: &[u8]) -> Result<usize>;
-    fn flush(&mut self) -> Result<()>;
+pub trait AsSSRawFd {
+    fn as_ssrawfd(&self) -> SSRawFd;
 }
 
-impl SSRawFd for RawFd {
-    fn to_c_int(&self) -> c_int {
-        *self
+impl<T: AsRawFd> AsSSRawFd for T {
+    fn as_ssrawfd(&self) -> SSRawFd {
+        SSRawFd(self.as_raw_fd())
     }
+}
 
+impl Read for SSRawFd {
     fn read(&mut self, buf: &mut [u8]) -> Result<usize> {
-        cvtsize(unsafe { libc::read(self.to_c_int(), buf.as_mut_ptr() as *mut c_void, buf.len() as size_t) })
+        cvtsize(unsafe { libc::read(self.0, buf.as_mut_ptr() as *mut c_void, buf.len() as size_t) })
     }
+}
 
+impl Write for SSRawFd {
     fn write(&mut self, buf: &[u8]) -> Result<usize> {
-        cvtsize(unsafe { libc::write(self.to_c_int(), buf.as_ptr() as *const c_void, buf.len() as size_t) })
+        cvtsize(unsafe { libc::write(self.0, buf.as_ptr() as *const c_void, buf.len() as size_t) })
     }
 
-    /// Always return succes, there is no userspace buffer here
+    /// Always return success, there is no userspace buffer here
     fn flush(&mut self) -> Result<()> {
         Ok(())
     }
 }
-
-
-// impl Write for SSRawFd {
-//     fn write(&mut self, buf: &[u8]) -> Result<usize> {
-//         cvtsize(unsafe { libc::write(self.to_c_int(), buf.as_ptr() as *const c_void, buf.len() as size_t) })
-//     }
-//
-//     /// Always return succes, there is no userspace buffer here
-//     fn flush(&mut self) -> Result<()> {
-//         Ok(())
-//     }
-// }

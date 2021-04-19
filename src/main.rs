@@ -1,13 +1,17 @@
+mod syscall_wrappers;
+
 use std::cmp::min;
 use std::convert::{TryFrom, TryInto};
 use std::fmt::{Display, Formatter};
 use std::fs::File;
 use std::io::{self, Error, ErrorKind, Read, Write};
+use std::iter::Map;
+use std::mem::replace;
 use std::mem::size_of;
-use std::os::unix::io::AsRawFd;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::slice::IterMut;
 use std::thread::sleep;
 use std::time::{Duration, Instant};
 
@@ -16,9 +20,8 @@ use once_cell::sync::Lazy;
 use structopt::StructOpt;
 
 use syscall_wrappers::*;
-use syscall_wrappers::UnixCalls;
+use syscall_wrappers::AsSSRawFd;
 
-mod syscall_wrappers;
 // The format! macro doesn't understand regular constants :(
 macro_rules! MERGE_SOCKET_NAME {
     () => {
@@ -30,7 +33,7 @@ macro_rules! debug {
     ($($arg:tt)*) => {
         if OPTS.verbose {
             // ensure output is written in a single write, to avoid mixing up writes from different processes
-            eprint!("{}", format_args!("{}\n", format_args!($($arg)*)));
+            eprint!("{}", format!("{}\n", format_args!($($arg)*)));
         }
     };
 }
@@ -40,8 +43,6 @@ macro_rules! debug {
 struct Opt {
     #[structopt(long, conflicts_with = "merge")]
     split: Option<u16>,
-    #[structopt(skip)]
-    splitcount: usize,
 
     #[structopt(long)]
     merge: bool,
@@ -80,7 +81,7 @@ struct Opt {
     output: Option<String>,
 
     /// input file. If not specified, stdin is used
-    #[structopt(short,long)]
+    #[structopt(short, long)]
     input: Option<String>,
 
     /// The directory to create the merging socket. Defaults to $XDG_RUNTIME_DIR or /tmp if that is not set.
@@ -117,29 +118,13 @@ impl Opt {
             }
         }
 
-        match self.split {
-            None => {}
-            Some(num) => self.splitcount = num.usize(),
+        if let Some(0) = self.split {
+            panic!("The number of splits must be > 0");
         }
 
         return self;
     }
 }
-
-#[derive(Debug)]
-pub enum CatError {
-    ReadError(Error),
-    WriteError(Error),
-    BytesLost(usize),
-}
-
-impl Display for CatError {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{:?}", self)
-    }
-}
-
-impl std::error::Error for CatError {}
 
 #[derive(PartialEq)]
 enum InputState {
@@ -179,17 +164,28 @@ impl WriteChainer<'_> {
     }
 }
 
+struct FileDeleter<'a> {
+    path: &'a Path,
+}
+impl Drop for FileDeleter<'_> {
+    fn drop(&mut self) {
+        if let Err(e) = std::fs::remove_file(self.path) {
+            eprintln!("Error: Deleting listening socket at {} failed: {:?}", self.path.to_string_lossy(), e);
+        };
+    }
+}
+
 /// An extension trait to ease conversion to usize. The conversion panics on failure, so we assume
 /// that usize is at least as wide as u32.
-trait USize {
+trait AsUSize {
     fn usize(self) -> usize;
 }
-impl USize for u16 {
+impl AsUSize for u16 {
     fn usize(self) -> usize {
         usize::try_from(self).unwrap()
     }
 }
-impl USize for u32 {
+impl AsUSize for u32 {
     fn usize(self) -> usize {
         usize::try_from(self).unwrap()
     }
@@ -257,8 +253,51 @@ impl Default for Header {
     }
 }
 
+/// Verifies that all readers are at EOF
+fn check_all_eof<'a>(readers: &mut [&mut dyn Read]) {
+    let mut buf = [0u8; 1];
+    for r in readers {
+        let count = r.read(&mut buf).unwrap();
+        if count != 0 {
+            panic!(
+                "Not all merge streams were finished at the same time. This could indicate data corruption"
+            );
+        }
+    }
+}
+
+/// Build the unix socket path to listen on
+fn socket_path(socket_dir: &str, guid: &[u8; 16]) -> PathBuf {
+    let mut sock = PathBuf::from(socket_dir);
+    let filename = format!(MERGE_SOCKET_NAME!(), hex::encode(guid));
+    sock.push(filename);
+    sock
+}
+
+/// Generate a random byte array from /dev/urandom
+fn random() -> [u8; 16] {
+    let mut r = File::open("/dev/urandom").expect("Failed to open /dev/urandom");
+    let mut buf = [0u8; 16];
+    r.read(&mut buf).expect("Error reading random number from /dev/urandom");
+    buf
+}
+
+/// Build the right Command given the input and options
+fn command(cmd: &[String]) -> Command {
+    if OPTS.no_sh {
+        let mut com = Command::new(&cmd[0]);
+        com.args(&cmd[1..]);
+        return com;
+    } else {
+        let shellcmd = cmd.join(" ");
+        let mut com = Command::new(&OPTS.sh);
+        com.arg("-c");
+        com.arg(shellcmd);
+        return com;
+    }
+}
+
 static OPTS: Lazy<Opt> = Lazy::new(|| Opt::from_args().init());
-static STDIN: Lazy<io::Stdin> = Lazy::new(|| io::stdin());
 
 fn main() {
     if let Some(splits) = OPTS.split {
@@ -266,30 +305,13 @@ fn main() {
     }
 
     if OPTS.merge {
-        let stdin = io::stdin();
-        merge(Box::new(stdin.lock()));
-    }
-    return;
-
-    match transfer_block(&mut io::stdin(), &mut io::stdout(), OPTS.blocksize.usize()) {
-        Ok(_) => {}
-        // Err(CatError::ReadError(e)) => {
-        //     eprintln!("Error while reading: {}", e)
-        // }
-        // Err(CatError::WriteError(e)) => {
-        //     eprintln!("Error while writing: {}", e)
-        // }
-        // Err(CatError::BytesLost(lost)) => {
-        //     eprintln!("not all input was written, {} bytes lost", lost)
-        // }
-        Err(e) => {
-            eprintln!("Error: {}", e);
-        }
+        // The file descriptor for stdin will stay open, despite dropping the stdin object
+        merge(&mut io::stdin().as_ssrawfd());
     }
 }
 
-fn merge<'a>(mut inp: Box<dyn Read + 'a>) {
-    let (hdr, hdrbytes) = Header::read_from_stream(&mut inp, "Invalid input stream");
+fn merge(inp: &mut dyn Read) {
+    let (hdr, hdrbytes) = Header::read_from_stream(inp, "Invalid input stream");
 
     let mut file: Box<dyn Write>;
     if hdr.stream_id == 0 {
@@ -297,17 +319,19 @@ fn merge<'a>(mut inp: Box<dyn Read + 'a>) {
         let out: &mut dyn Write = match OPTS.output.as_ref().map(String::as_str) {
             None => {
                 cmd = command(&OPTS.command)
-                    .stdin(Stdio::piped()).spawn().expect("Unable to start child process");
+                    .stdin(Stdio::piped())
+                    .spawn()
+                    .expect("Unable to start child process");
                 cmd.stdin.as_mut().unwrap()
-            },
+            }
             Some("-") => {
                 file = Box::new(io::stdout());
                 &mut file
-            },
+            }
             Some(f) => {
                 file = Box::new(File::open(f).expect(&format!("Error opening {}", f)));
                 &mut file
-            },
+            }
         };
 
         merge_master(hdr, inp, out);
@@ -318,18 +342,7 @@ fn merge<'a>(mut inp: Box<dyn Read + 'a>) {
     }
 }
 
-struct FileDeleter<'a> {
-    path: &'a Path,
-}
-impl Drop for FileDeleter<'_> {
-    fn drop(&mut self) {
-        if let Err(e) = std::fs::remove_file(self.path) {
-            eprintln!("Deleting listening socket at {} failed: {:?}", self.path.to_string_lossy(), e);
-        };
-    }
-}
-
-fn merge_master<'a>(hdr: Header, inp: Box<dyn Read + 'a>, outp: &mut dyn Write) {
+fn merge_master<'a>(hdr: Header, inp: &mut dyn Read, outp: &mut dyn Write) {
     // Set umask so only this user has access to the socket, just to be safe
     let old_umask = umask(0o177);
     let socketpath = socket_path(&OPTS.socket_dir, &hdr.streamsplit_id);
@@ -337,13 +350,11 @@ fn merge_master<'a>(hdr: Header, inp: Box<dyn Read + 'a>, outp: &mut dyn Write) 
         panic!("Unable to create socket at {}: {:?}", socketpath.as_path().to_string_lossy(), e)
     });
     umask(old_umask);
-    let _deleter = FileDeleter { path: &socketpath };
+    let deleter = FileDeleter { path: &socketpath };
 
-    let mut streams: Vec<Box<dyn Read + 'a>> = Vec::with_capacity(hdr.splits.usize());
-    // for _ in 0..stream_opts.capacity() {
-    //     stream_opts.push(None);
-    // }
-    streams[0] = inp;
+    // The socket positions are at stream_id - 1
+    let mut sockets = Vec::with_capacity(hdr.splits.usize() - 1);
+    sockets.resize_with(sockets.capacity(), || None);
 
     debug!("Merge master: socket created. 1 of {} merge streams connected", hdr.splits);
 
@@ -370,20 +381,31 @@ fn merge_master<'a>(hdr: Header, inp: Box<dyn Read + 'a>, outp: &mut dyn Write) 
                     panic!("Invalid merge stream: connecting stream has stream id 0, which is invalid")
                 }
 
-                streams[streamhdr.stream_id.usize()] = Box::new(stream);
+                if let Some(_) = replace(&mut sockets[streamhdr.stream_id.usize() - 1], Some(stream)) {
+                    panic!(
+                        "Invalid merge stream: Multiple streams with id {} tried to connect",
+                        streamhdr.stream_id
+                    );
+                }
                 connected_slaves += 1;
                 debug!("Merge master: {} of {} merge streams connected", connected_slaves, hdr.splits);
             }
         }
     }
 
-//    let mut streams: Vec<Box<dyn Read>> = stream_opts.into_iter().map(|s| s.unwrap).collect();
+    // remove socket file
+    drop(deleter);
+
+    //let mut streams: Vec<Box<dyn Read>> = stream_opts.into_iter().map(|s| s.unwrap()).collect();
+    let mut streams: Vec<&mut dyn Read> = Vec::with_capacity(hdr.splits.usize());
+    streams.push(inp);
+    streams.extend(sockets.iter_mut().map(|s| -> &mut dyn Read { s.as_mut().unwrap() }));
 
     sleep(Duration::from_millis(u64::from(OPTS.pause_after_close)));
 
     'outer: loop {
         for i in 0..streams.len() {
-            let state = transfer_block(&mut *streams[i], &mut *outp, hdr.blocksize.usize()).unwrap();
+            let state = transfer_block(streams[i], &mut *outp, hdr.blocksize.usize()).unwrap();
             if state == InputState::Done {
                 break 'outer;
             }
@@ -393,7 +415,7 @@ fn merge_master<'a>(hdr: Header, inp: Box<dyn Read + 'a>, outp: &mut dyn Write) 
     check_all_eof(streams.as_mut_slice());
 }
 
-fn merge_slave<'a>(hdr: Header, hdrbytes: [u8; size_of::<Header>()], mut inp: Box<dyn Read + 'a>) {
+fn merge_slave(hdr: Header, hdrbytes: [u8; size_of::<Header>()], inp: &mut dyn Read) {
     debug!("slave merger #{} trying to connect...", hdr.stream_id);
 
     let socketpath = socket_path(&OPTS.socket_dir, &hdr.streamsplit_id);
@@ -422,7 +444,7 @@ fn merge_slave<'a>(hdr: Header, hdrbytes: [u8; size_of::<Header>()], mut inp: Bo
     };
 
     // Close stdout to let any pipelined processes exit, they should only keep running from the merge master
-    io::stdout().close().expect("Closing stdout failed");
+    io::stdout().as_ssrawfd().close().expect("Closing stdout failed");
 
     socket.write_all(&hdrbytes).expect("Error writing to merge socket");
 
@@ -431,44 +453,15 @@ fn merge_slave<'a>(hdr: Header, hdrbytes: [u8; size_of::<Header>()], mut inp: Bo
     let mut buf = vec![0u8; 64 * 1024];
     loop {
         let count = inp.read(&mut buf).expect("Error reading from stdin");
-        debug!("slave merger #{}: read {} bytes", hdr.stream_id, count);
         if count == 0 {
             break; // EOF
         }
         socket.write_all(&buf[..count]).expect("Error writing to merge socket");
     }
-
-    socket.close().expect("Closing socket failed");
-}
-
-fn check_all_eof<'a>(readers: &mut [Box<dyn Read + 'a>]) {
-    let mut buf = [0u8; 1];
-    for r in readers.iter_mut() {
-        let count = r.read(&mut buf).unwrap();
-        if count != 0 {
-            panic!(
-                "Not all merge streams were finished at the same time. This could indicate data corruption"
-            );
-        }
-    }
-}
-
-fn socket_path(socket_dir: &str, guid: &[u8; 16]) -> PathBuf {
-    let mut sock = PathBuf::from(socket_dir);
-    let filename = format!(MERGE_SOCKET_NAME!(), hex::encode(guid));
-    sock.push(filename);
-    sock
-}
-
-fn random() -> [u8; 16] {
-    let mut r = File::open("/dev/urandom").expect("Failed to open /dev/urandom");
-    let mut buf = [0u8; 16];
-    r.read(&mut buf).expect("Error reading random number from /dev/urandom");
-    buf
 }
 
 fn split(num: u16) {
-    let mut inp: &mut dyn Read = &mut STDIN.lock();
+    let mut inp: &mut dyn Read = &mut io::stdin().as_ssrawfd();
     let mut infile;
     match &OPTS.input.as_ref().map(|s| s.as_str()) {
         None => {}
@@ -490,7 +483,7 @@ fn split(num: u16) {
     for i in 0..num {
         let child = command(&OPTS.command)
             .stdin(Stdio::piped())
-            .env("STREAMSPLIT_N", (i + 1).to_string())
+            .env("STREAMSPLIT_N", i.to_string())
             .spawn()
             .expect("Unable to start child process");
 
@@ -546,20 +539,6 @@ fn split(num: u16) {
 
     children.clear();
     debug!("splitter exiting");
-}
-
-fn command(cmd: &[String]) -> Command {
-    if OPTS.no_sh {
-        let mut com = Command::new(&cmd[0]);
-        com.args(&cmd[1..]);
-        return com;
-    } else {
-        let shellcmd = cmd.join(" ");
-        let mut com = Command::new(&OPTS.sh);
-        com.arg("-c");
-        com.arg(shellcmd);
-        return com;
-    }
 }
 
 fn transfer_block(inp: &mut dyn Read, out: &mut dyn Write, blocksize: usize) -> Result<InputState, Error> {

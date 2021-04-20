@@ -6,6 +6,7 @@ use std::io::{Error, Read, Result, Write};
 use std::ops::Neg;
 use std::os::raw::c_int;
 use std::os::unix::io::{AsRawFd, RawFd};
+use std::ptr;
 
 fn cvt<N: Eq + Neg<Output = N> + One>(t: N) -> Result<N> {
     if t == -N::one() {
@@ -28,12 +29,18 @@ pub fn umask(mask: libc::mode_t) -> libc::mode_t {
 }
 
 #[repr(transparent)]
-#[derive(Copy, Clone)]
+#[derive(Copy, Clone, Debug)]
 pub struct SSRawFd(RawFd);
 
 impl SSRawFd {
     pub fn close(&self) -> Result<c_int> {
         cvt(unsafe { libc::close(self.0) })
+    }
+
+    pub fn splice_to(&self, dest: SSRawFd, len: usize) -> Result<size_t> {
+        cvtsize(unsafe {
+            libc::splice(self.0, ptr::null_mut(), dest.0, ptr::null_mut(), len, libc::SPLICE_F_MOVE)
+        })
     }
 }
 

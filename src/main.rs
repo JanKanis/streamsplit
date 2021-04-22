@@ -1,9 +1,7 @@
-mod syscall_wrappers;
-
 use std::cmp::min;
 use std::convert::{TryFrom, TryInto};
 use std::fs::File;
-use std::io::{self, Error, ErrorKind, Read, Write};
+use std::io::{self, ErrorKind, Read, Write};
 use std::mem::replace;
 use std::mem::size_of;
 use std::os::unix::net::{UnixListener, UnixStream};
@@ -16,8 +14,9 @@ use hex;
 use once_cell::sync::Lazy;
 use structopt::StructOpt;
 
-use syscall_wrappers::AsSSRawFd;
-use syscall_wrappers::*;
+use streamsplit::syscall_wrappers::AsSSRawFd;
+use streamsplit::syscall_wrappers::*;
+use streamsplit::transfer::{InputState, Transfer};
 
 // The format! macro doesn't understand regular constants :(
 macro_rules! MERGE_SOCKET_NAME {
@@ -121,12 +120,6 @@ impl Opt {
 
         return self;
     }
-}
-
-#[derive(PartialEq)]
-enum InputState {
-    More,
-    Done,
 }
 
 // Ostensibly a #[repr(C, packed)], but I'm sticking to safe reading/writing so the actual layout isn't relevant
@@ -311,8 +304,7 @@ fn split(num: u16) {
     let mut inp = io::stdin().as_ssrawfd();
     let infile;
     match &OPTS.input.as_ref().map(|s| s.as_str()) {
-        None => {}
-        Some("-") => {}
+        None | Some("-") => {}
         Some(path) => {
             infile = File::open(path).expect("unable to open input file");
             inp = infile.as_ssrawfd();
@@ -346,11 +338,12 @@ fn split(num: u16) {
         debug!("Splitter child {} started", i);
     }
 
-    let mut transfer = Transfer::new("Splitter");
+    let blocksize = OPTS.blocksize.usize();
+    let mut transfer = Transfer::new("Splitter", OPTS.verbose);
     'outer: loop {
         for i in 0..children.len() {
             // let inputstate = transfer_block(inp, children_fds[i], OPTS.blocksize.usize()).unwrap();
-            let inputstate = transfer.block(inp, children_fds[i], OPTS.blocksize.usize());
+            let inputstate = transfer.block(inp, children_fds[i], blocksize);
             if inputstate == InputState::Done {
                 break 'outer;
             }
@@ -398,7 +391,7 @@ fn merge(inp: SSRawFd) {
             }
             Some("-") => io::stdout().as_ssrawfd(),
             Some(f) => {
-                file = File::open(f).expect(&format!("Error opening {}", f));
+                file = File::create(f).expect(&format!("Error opening {}", f));
                 file.as_ssrawfd()
             }
         };
@@ -472,11 +465,11 @@ fn merge_master(hdr: Header, inp: SSRawFd, outp: SSRawFd) {
 
     sleep(Duration::from_millis(u64::from(OPTS.pause_after_close)));
 
-    let mut transfer = Transfer::new("Merge master");
+    let blocksize = OPTS.blocksize.usize();
+    let mut transfer = Transfer::new("Merge master", OPTS.verbose);
     'outer: loop {
         for i in 0..streams.len() {
-            let state = transfer.block(streams[i], outp, hdr.blocksize.usize());
-            // let state = transfer_block(streams[i], outp, hdr.blocksize.usize()).unwrap();
+            let state = transfer.block(streams[i], outp, blocksize);
             if state == InputState::Done {
                 break 'outer;
             }
@@ -486,7 +479,7 @@ fn merge_master(hdr: Header, inp: SSRawFd, outp: SSRawFd) {
     check_all_eof(streams.as_mut_slice());
 }
 
-fn merge_slave(hdr: Header, hdrbytes: [u8; size_of::<Header>()], mut inp: SSRawFd) {
+fn merge_slave(hdr: Header, hdrbytes: [u8; size_of::<Header>()], inp: SSRawFd) {
     debug!("slave merger #{} trying to connect...", hdr.stream_id);
 
     let socketpath = socket_path(&OPTS.socket_dir, &hdr.streamsplit_id);
@@ -522,87 +515,5 @@ fn merge_slave(hdr: Header, hdrbytes: [u8; size_of::<Header>()], mut inp: SSRawF
 
     debug!("slave merger #{} connected", hdr.stream_id);
 
-    Transfer::new(&format!("slave merger #{}", hdr.stream_id)).to_end(inp, socket, 64*1024);
-    // return;
-    //
-    // let mut buf = vec![0u8; 64 * 1024];
-    // loop {
-    //     let count = inp.read(&mut buf).expect("Error reading from stdin");
-    //     if count == 0 {
-    //         break; // EOF
-    //     }
-    //     socket.write_all(&buf[..count]).expect("Error writing to merge socket");
-    // }
-}
-
-// fn transfer_block(mut inp: SSRawFd, mut out: SSRawFd, blocksize: usize) -> Result<InputState, Error> {
-//     let mut buffer = vec![0u8; blocksize];
-//
-//     let mut readcount = 0usize;
-//     while readcount < blocksize {
-//         let read = inp.read(&mut buffer[readcount..])?;
-//         if read == 0 {
-//             return Ok(InputState::Done);
-//         }
-//         out.write_all(&buffer[readcount..readcount + read])?;
-//         readcount += read;
-//     }
-//     return Ok(InputState::More);
-// }
-
-#[derive(Default)]
-struct Transfer<'a> { try_splice: bool, err_context: &'a str, buffer: Vec<u8> }
-
-impl Transfer<'_> {
-    fn new(err_context: &str) -> Transfer {
-        Transfer {try_splice: true, err_context, buffer: Vec::new()}
-    }
-
-    #[inline(always)]
-    fn to_end(&mut self, mut inp: SSRawFd, mut outp: SSRawFd, blocksize: usize) {
-        while self.single_read(inp, outp, blocksize) != 0 {}
-    }
-
-    #[inline(always)]
-    fn single_read(&mut self, mut inp: SSRawFd, mut outp: SSRawFd, blocksize: usize) -> usize {
-        if self.try_splice {
-            match inp.splice_to(outp, blocksize) {
-                Ok(count) => { return count }
-                Err(e) => {
-                    if e.raw_os_error().unwrap() == libc::ENOSYS
-                    || e.kind() == ErrorKind::InvalidInput {
-                        self.try_splice = false;
-                        debug!("{}: splice() not possible, falling back to read/write", self.err_context);
-                    } else {
-                        panic!("{}: Error splicing data: {:?}", self.err_context, e);
-                    }
-                }
-            }
-        }
-
-        self.reserve(blocksize);
-        let count = inp.read(&mut self.buffer).expect("{}: Error reading from input");
-        outp.write_all(&self.buffer[..count]).expect("{}: Error writing to output");
-        return count;
-    }
-
-    #[inline(always)]
-    fn reserve(&mut self, size: usize) {
-        if self.buffer.len() < size {
-            self.buffer.resize(size, 0);
-        }
-    }
-
-    #[inline(always)]
-    fn block(&mut self, mut inp: SSRawFd, mut outp: SSRawFd, blocksize: usize) -> InputState {
-        let mut read = 0usize;
-        while read < blocksize {
-            let cnt = self.single_read(inp, outp, blocksize - read);
-            if cnt == 0 {
-                return InputState::Done;
-            }
-            read += cnt;
-        }
-        InputState::More
-    }
+    Transfer::new(&format!("slave merger #{}", hdr.stream_id), OPTS.verbose).to_end(inp, socket, 64*1024);
 }

@@ -295,8 +295,7 @@ fn main() {
     }
 
     if OPTS.merge {
-        // The file descriptor for stdin will stay open, despite dropping the stdin object
-        merge(io::stdin().as_ssrawfd());
+        merge();
     }
 }
 
@@ -342,9 +341,7 @@ fn split(num: u16) {
     let mut transfer = Transfer::new("Splitter", OPTS.verbose);
     'outer: loop {
         for i in 0..children.len() {
-            // let inputstate = transfer_block(inp, children_fds[i], OPTS.blocksize.usize()).unwrap();
-            let inputstate = transfer.block(inp, children_fds[i], blocksize);
-            if inputstate == InputState::Done {
+            if transfer.block(inp, children_fds[i], blocksize) == InputState::Done {
                 break 'outer;
             }
         }
@@ -375,21 +372,23 @@ fn split(num: u16) {
     debug!("splitter exiting");
 }
 
-fn merge(inp: SSRawFd) {
+fn merge() {
+    // The file descriptor for stdin will stay open, despite dropping the stdin object
+    let inp = io::stdin().as_ssrawfd();
     let (hdr, hdrbytes) = Header::read_from_stream(inp, "Invalid input stream");
 
     let file: File;
     if hdr.stream_id == 0 {
         let mut cmd;
         let out = match OPTS.output.as_ref().map(String::as_str) {
-            None => {
+            None if !OPTS.command.is_empty() => {
                 cmd = command(&OPTS.command)
                     .stdin(Stdio::piped())
                     .spawn()
                     .expect("Unable to start child process");
                 cmd.stdin.as_mut().unwrap().as_ssrawfd()
             }
-            Some("-") => io::stdout().as_ssrawfd(),
+            None | Some("-") => io::stdout().as_ssrawfd(),
             Some(f) => {
                 file = File::create(f).expect(&format!("Error opening {}", f));
                 file.as_ssrawfd()
@@ -405,7 +404,8 @@ fn merge(inp: SSRawFd) {
 }
 
 fn merge_master(hdr: Header, inp: SSRawFd, outp: SSRawFd) {
-    // Set umask so only this user has access to the socket, just to be safe
+    // Set umask so only this user has access to the socket, just to be safe. It doesn't look like
+    // it is possible tp pass a umask when binding the socket.
     let old_umask = umask(0o177);
     let socketpath = socket_path(&OPTS.socket_dir, &hdr.streamsplit_id);
     let listener = UnixListener::bind(socketpath.as_path()).unwrap_or_else(|e| {
@@ -420,7 +420,7 @@ fn merge_master(hdr: Header, inp: SSRawFd, outp: SSRawFd) {
 
     debug!("Merge master: socket created. 1 of {} merge streams connected", hdr.splits);
 
-    // This process also counts for 1
+     // The current process also counts for 1
     let mut connected_slaves = 1;
     while connected_slaves < hdr.splits {
         match listener.accept() {
@@ -458,7 +458,6 @@ fn merge_master(hdr: Header, inp: SSRawFd, outp: SSRawFd) {
     // remove socket file
     drop(deleter);
 
-    //let mut streams: Vec<Box<dyn Read>> = stream_opts.into_iter().map(|s| s.unwrap()).collect();
     let mut streams: Vec<SSRawFd> = Vec::with_capacity(hdr.splits.usize());
     streams.push(inp);
     streams.extend(sockets.iter().map(|s| s.as_ref().unwrap().as_ssrawfd()));
@@ -469,8 +468,7 @@ fn merge_master(hdr: Header, inp: SSRawFd, outp: SSRawFd) {
     let mut transfer = Transfer::new("Merge master", OPTS.verbose);
     'outer: loop {
         for i in 0..streams.len() {
-            let state = transfer.block(streams[i], outp, blocksize);
-            if state == InputState::Done {
+            if transfer.block(streams[i], outp, blocksize) == InputState::Done {
                 break 'outer;
             }
         }

@@ -420,7 +420,7 @@ fn merge_master(hdr: Header, inp: SSRawFd, outp: SSRawFd) {
 
     debug!("Merge master: socket created. 1 of {} merge streams connected", hdr.splits);
 
-     // The current process also counts for 1
+    // The current process also counts for 1
     let mut connected_slaves = 1;
     while connected_slaves < hdr.splits {
         match listener.accept() {

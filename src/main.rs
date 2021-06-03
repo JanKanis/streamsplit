@@ -1,5 +1,6 @@
 use std::cmp::min;
 use std::convert::{TryFrom, TryInto};
+use std::env::args;
 use std::fs::File;
 use std::io::{self, ErrorKind, Read, Write};
 use std::mem::replace;
@@ -17,6 +18,7 @@ use structopt::StructOpt;
 use streamsplit::syscall_wrappers::AsSSRawFd;
 use streamsplit::syscall_wrappers::*;
 use streamsplit::transfer::{InputState, Transfer};
+use std::iter::FromIterator;
 
 // The format! macro doesn't understand regular constants :(
 macro_rules! MERGE_SOCKET_NAME {
@@ -45,7 +47,8 @@ struct Opt {
 
     /// By default streamsplit will add a header to the resulting streams that will allow another
     /// instance of streamsplit to merge the streams back together. This flag disables the header,
-    ///
+    /// leaving bare streams of blocks. Streamsplit cannot merge these back together, so they won't
+    /// be useful for most users.
     #[structopt(long)]
     no_header: bool,
 
@@ -84,11 +87,11 @@ struct Opt {
     #[structopt(long, env = "XDG_RUNTIME_DIR", default_value = "/tmp")]
     socket_dir: String,
 
-    //#[structopt(last)]
-    #[structopt(name = "command", subcommand)]
-    _command: Subcommand,
     #[structopt(skip)]
     command: Vec<String>,
+
+    #[structopt(subcommand)]
+    subcommand: Subcommand,
 
     #[structopt(long, short)]
     verbose: bool,
@@ -96,22 +99,37 @@ struct Opt {
 
 #[derive(Debug, PartialEq, StructOpt)]
 enum Subcommand {
-    #[structopt(external_subcommand)]
-    Command(Vec<String>),
+    Split {
+        splits: u16,
+        #[structopt(name = "command", subcommand)]
+        _command: Option<FinalArg>,
+    },
+    Merge {
+        #[structopt(name = "command", subcommand)]
+        _command: Option<FinalArg>,
+    },
 }
 
 impl Default for Subcommand {
     fn default() -> Self {
-        Subcommand::Command(Vec::new())
+        Subcommand::Split {splits: 0, _command: None}
     }
+}
+
+#[derive(Debug, PartialEq, StructOpt)]
+enum FinalArg {
+    #[structopt(external_subcommand)]
+    Arg(Vec<String>),
 }
 
 impl Opt {
     fn init(mut self) -> Self {
-        match &mut self._command {
-            Subcommand::Command(cmd) => {
-                std::mem::swap(&mut self.command, cmd);
-            }
+        let mut cmd = match &mut self.subcommand {
+            Subcommand::Split { _command: cmd , ..} => cmd,
+            Subcommand::Merge { _command: cmd} => cmd,
+        };
+        if let Some(FinalArg::Arg(cmd)) = cmd {
+            std::mem::swap(&mut self.command, cmd);
         }
 
         if let Some(0) = self.split {
@@ -289,7 +307,52 @@ fn command(cmd: &[String]) -> Command {
 
 static OPTS: Lazy<Opt> = Lazy::new(|| Opt::from_args().init());
 
+fn parse_args(args: Vec<String>) {
+    let mut start_of_cmd = args.len();
+    for (i, s) in args.iter().enumerate().skip(1) {  // skip program name
+        if i == 1 && (s == "split" || s == "merge") {
+            continue
+        }
+        if s == "--" {
+            start_of_cmd = i+1;
+            break
+        }
+        if s.as_str()[..1] == *"-" {
+            continue
+        } else {
+            start_of_cmd = i;
+            break
+        }
+    }
+
+    //let opts = Opt::from_iter(args[..start_of_cmd]);
+
+    println!("start of cmd: {}", start_of_cmd);
+    println!("opts: {:?}", &args[..start_of_cmd]);
+    println!("cmd: {:?}", &args[start_of_cmd..]);
+    println!("args: {:?}", args);
+
+    // let mut flags = Vec::new();
+    // let mut args = std::env::args();
+    // flags.extend(args)
+
+    panic!()
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn test_parse_args() {
+
+    }
+}
+
 fn main() {
+    // println!("{:?}", std::env::args());
+    // parse_args(Vec::from_iter(args()));
+    // return;
+    println!("{:?}", Lazy::force(&OPTS));
+
     if let Some(splits) = OPTS.split {
         split(splits);
     }

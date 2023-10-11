@@ -25,6 +25,7 @@ impl Transfer<'_> {
 
     #[inline(always)]
     pub fn single_read(&mut self, mut inp: SSRawFd, mut outp: SSRawFd, blocksize: usize) -> usize {
+        debug_assert!(blocksize > 0);
         if self.try_splice {
             match inp.splice_to(outp, blocksize) {
                 Ok(count) => { return count }
@@ -58,6 +59,7 @@ impl Transfer<'_> {
 
     #[inline(always)]
     pub fn block(&mut self, inp: SSRawFd, outp: SSRawFd, blocksize: usize) -> InputState {
+        debug_assert!(blocksize > 0);
         let mut read = 0usize;
         while read < blocksize {
             let cnt = self.single_read(inp, outp, blocksize - read);

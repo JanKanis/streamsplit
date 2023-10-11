@@ -4,13 +4,13 @@ Streamsplit
 
 This is a command line tool to split a data stream into multiple streams, and merge those streams together again to recrate the original stream.
 
-The original reason for this program was to speed up data transfer over SSH where the machines don't have hardware encryption support but do have a fast network connection and multiple cpu cores. SSH is not multi-threaded, and doesn't plan to add that for fear of bugs. In such cases, the SSH encryption can become the limiting factor in transferring data over SSH. `streamsplit` can help speed up the transfer by splitting the datastream into multiple streams, each of which can be sent over an independent SSH channel, and they can be recombined at the destination.
+The original reason for this program was to speed up data transfer over SSH where the machines don't have hardware encryption support but do have a fast network connection and multiple cpu cores. SSH is not multi-threaded, and doesn't plan to add that for fear introducing security issues. In such cases, the SSH encryption can become the limiting factor in transferring data over SSH. `streamsplit` can help speed up the transfer by splitting the datastream into multiple streams, each of which can be sent over an independent SSH channel, and they can be recombined at the destination.
 
 Example usage:
 
 Test transfer speed by sending data from `/dev/zero`. Use `pv` on `remoteserver` to measure the speed:
 
-	streamsplit -i /dev/zero -v --split=2 'ssh remoteserver streamsplit -v --merge "pv -f >/dev/null"'
+	streamsplit -v split 2 -i /dev/zero 'ssh remoteserver streamsplit -v merge "pv -f >/dev/null"'
 
 File transfer:
 

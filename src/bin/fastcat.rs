@@ -7,10 +7,11 @@ use structopt::StructOpt;
 use streamsplit::syscall_wrappers::AsSSRawFd;
 use streamsplit::transfer::Transfer;
 
-
-
 #[derive(Debug, Default, StructOpt)]
-#[structopt(name = "fastcat", about = "A cat command that uses splice internally when possible for higher performance")]
+#[structopt(
+    name = "fastcat",
+    about = "A cat command that uses splice internally when possible for higher performance"
+)]
 struct Opt {
     /// input file. If not specified, stdin is used
     input: Option<String>,

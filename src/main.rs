@@ -13,10 +13,10 @@ use hex;
 use once_cell::sync::Lazy;
 use structopt::StructOpt;
 
+use std::ffi::{OsStr, OsString};
 use streamsplit::syscall_wrappers::AsSSRawFd;
 use streamsplit::syscall_wrappers::*;
 use streamsplit::transfer::{InputState, Transfer};
-use std::ffi::{OsString, OsStr};
 
 // The format! macro doesn't understand regular constants :(
 macro_rules! MERGE_SOCKET_NAME {
@@ -35,13 +35,21 @@ macro_rules! debug {
 }
 
 #[derive(Debug, Default, StructOpt)]
-#[structopt(name = "streamsplit",
-    about = "Split a byte stream into multiple streams and merge them back",
-    long_about = ""
-)]
+#[structopt(name = "streamsplit")]
+/// Split a byte stream into multiple streams and merge them back.
+///
+/// Split a byte stream into multiple streams and merge them back. This can be useful to e.g. send
+/// a big file in multiple streams in parallel across a network. If available, the splice system
+/// call will be used.
+///
+/// Example:
+///     streamsplit -i ./mybigfile split 2 'ssh remoteserver streamsplit merge -o ./destinationfile'
+///
+/// Transfer speed test example (using `pv` on remoteserver):
+///     streamsplit -v split 2 -i /dev/zero 'ssh remoteserver streamsplit -v merge "pv -f >/dev/null"'
 struct Opt {
-    /// The shell used to interpret commands. Defaults to the user's default shell in $SHELL.
-    #[structopt(long, env = "SHELL", default_value = "/bin/sh")]
+    /// The shell used to interpret commands. Defaults to /bin/sh.
+    #[structopt(long, default_value = "/bin/sh")]
     sh: String,
 
     /// Do not interpret the command as a shell command, but run it directly
@@ -52,6 +60,7 @@ struct Opt {
     #[structopt(subcommand)]
     action: Action,
 
+    /// Print more diagnostics
     #[structopt(long, short)]
     verbose: bool,
 
@@ -81,7 +90,9 @@ struct Opt {
 
 #[derive(Debug, PartialEq, StructOpt)]
 enum Action {
-    /// Split description
+    /// Split the input stream or file blockwise into <splits> streams. Run <splits> instances of
+    /// SUBCOMMAND, each receives one of the <splits> streams as input. SUBCOMMAND can be either a
+    /// shell command or a plain command, see the --sh and --no-sh options.
     Split {
         /// The number of resulting streams to split the input in to
         splits: u16,
@@ -102,12 +113,17 @@ enum Action {
         #[structopt(short, long)]
         input: Option<String>,
 
-        /// todo
+        /// SUBCOMMAND will be executed (as shell command or as plain command, see --no-sh option) for
+        /// each stream. The subcommand should result in executing `streamsplit merge` on the (possibly
+        /// remote) location where the streams should be merged back together.
         #[structopt(name = "command", subcommand)]
         _command: Option<SubCommand>,
     },
 
-    /// Merge action description
+    /// Merge the streams from `streamsplit split` back together, resulting in the same byte stream
+    /// as `streamsplit split` originally received. The result will be written to the master merge
+    /// process' stdout or, if given, the SUBCOMMAND. SUBCOMMAND can be either a shell command or a
+    /// plain command (see the --sh and --no-sh options).
     Merge {
         /// timeout in ms when waiting for the master merge socket to appear
         #[structopt(short, long, default_value = "5000")]
@@ -119,7 +135,7 @@ enum Action {
         pause_after_close: u32,
 
         /// Output file for the merged stream. If not used, the merged stream will be written to the
-        /// leading process's stdout.
+        /// leading process's SUBCOMMAND or standard out.
         #[structopt(short, long)]
         output: Option<String>,
 
@@ -127,7 +143,9 @@ enum Action {
         #[structopt(long, env = "XDG_RUNTIME_DIR", default_value = "/tmp")]
         socket_dir: String,
 
-        /// todo
+        /// The merged stream will be passed to the SUBCOMMAND, which can be either a shell command or a plain
+        /// command (see the --no-sh option). SUBCOMMAND is only executed once, and receives the same input
+        /// stream as the sending `streamsplit split` command received.
         #[structopt(name = "command", subcommand)]
         _command: Option<SubCommand>,
     },
@@ -135,7 +153,7 @@ enum Action {
 
 impl Default for Action {
     fn default() -> Self {
-        Action::Split {splits: 0, no_header: false, blocksize: 0, input: None, _command: None}
+        Action::Split { splits: 0, no_header: false, blocksize: 0, input: None, _command: None }
     }
 }
 
@@ -157,7 +175,7 @@ impl Opt {
         // it, but Rust does not yet have refinement types so that is not possible. To keep the code
         // manageable we give up some type safety and copy all the options to the Opt type.
         match &mut self.action {
-            Action::Split { splits, no_header, blocksize, input, _command} => {
+            Action::Split { splits, no_header, blocksize, input, _command } => {
                 self.splits = *splits;
                 self.no_header = *no_header;
                 self.blocksize = *blocksize;
@@ -372,16 +390,15 @@ fn main() {
     // println!("{:?}", std::env::args());
     // parse_args(Vec::from_iter(args()));
     // return;
-    println!("{:?}", ["a", "b"].join(","));
-    println!("{:?}", Lazy::force(&OPTS));
+
+    // show parsed command line options:
+    // println!("{:?}", Lazy::force(&OPTS));
 
     match &OPTS.action {
-        Action::Split { splits, ..} => {
+        Action::Split { splits, .. } => {
             split(*splits);
         }
-        Action::Merge {..} => {
-            merge()
-        }
+        Action::Merge { .. } => merge(),
     }
 }
 
@@ -599,5 +616,5 @@ fn merge_slave(hdr: Header, hdrbytes: [u8; size_of::<Header>()], inp: SSRawFd) {
 
     debug!("slave merger #{} connected", hdr.stream_id);
 
-    Transfer::new(&format!("slave merger #{}", hdr.stream_id), OPTS.verbose).to_end(inp, socket, 64*1024);
+    Transfer::new(&format!("slave merger #{}", hdr.stream_id), OPTS.verbose).to_end(inp, socket, 64 * 1024);
 }

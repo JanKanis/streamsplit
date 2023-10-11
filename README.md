@@ -6,7 +6,7 @@ This is a command line tool to split a data stream into multiple streams, and me
 
 The original reason for this program was to speed up data transfer over SSH where the machines don't have hardware encryption support but do have a fast network connection and multiple cpu cores. SSH is not multi-threaded, and doesn't plan to add that for fear introducing security issues. In such cases, the SSH encryption can become the limiting factor in transferring data over SSH. `streamsplit` can help speed up the transfer by splitting the datastream into multiple streams, each of which can be sent over an independent SSH channel, and they can be recombined at the destination.
 
-Example usage:
+Example usage: (the `streamsplit` binary needs to be available on both the local and remote machines)
 
 Test transfer speed by sending data from `/dev/zero`. Use `pv` on `remoteserver` to measure the speed:
 
@@ -14,9 +14,13 @@ Test transfer speed by sending data from `/dev/zero`. Use `pv` on `remoteserver`
 
 File transfer:
 
-	streamsplit -i ./mybigfile --split=2 'ssh remoteserver streamsplit --merge -o ./destinationfile dummyargument
+	streamsplit -i ./mybigfile split 2 'ssh remoteserver streamsplit merge -o ./destinationfile'
 
-(`dummyargument` is needed due to a bug, the command line parsing still needs some work)
+
+Build
+-----
+
+To build, you will need the Rust build tools installed. Then run `cargo build --release --bin streamsplit`
 
 
 License

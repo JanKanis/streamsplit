@@ -2,7 +2,6 @@ use std::io::{ErrorKind, Read, Write};
 
 use crate::syscall_wrappers::SSRawFd;
 
-
 #[derive(PartialEq)]
 pub enum InputState {
     More,
@@ -10,12 +9,17 @@ pub enum InputState {
 }
 
 #[derive(Default)]
-pub struct Transfer<'a> { try_splice: bool, err_context: &'a str, buffer: Vec<u8>, verbose: bool }
+pub struct Transfer<'a> {
+    try_splice: bool,
+    err_context: &'a str,
+    buffer: Vec<u8>,
+    verbose: bool,
+}
 
 impl Transfer<'_> {
     #[inline(always)]
     pub fn new(err_context: &str, verbose: bool) -> Transfer {
-        Transfer {try_splice: true, err_context, buffer: Vec::new(), verbose: verbose}
+        Transfer { try_splice: true, err_context, buffer: Vec::new(), verbose: verbose }
     }
 
     #[inline(always)]
@@ -28,7 +32,7 @@ impl Transfer<'_> {
         debug_assert!(blocksize > 0);
         if self.try_splice {
             match inp.splice_to(outp, blocksize) {
-                Ok(count) => { return count }
+                Ok(count) => return count,
                 Err(e) => {
                     if e.raw_os_error().unwrap() == libc::ENOSYS
                         || e.kind() == ErrorKind::InvalidInput {

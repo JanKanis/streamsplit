@@ -43,9 +43,11 @@ macro_rules! debug {
 /// call will be used.
 ///
 /// Example:
-///     streamsplit -i ./mybigfile split 2 'ssh remoteserver streamsplit merge -o ./destinationfile'
+///
+///     streamsplit split 2 -i ./mybigfile 'ssh remoteserver streamsplit merge -o ./destinationfile'
 ///
 /// Transfer speed test example (using `pv` on remoteserver):
+///
 ///     streamsplit -v split 2 -i /dev/zero 'ssh remoteserver streamsplit -v merge "pv -f >/dev/null"'
 struct Opt {
     /// The shell used to interpret commands. Defaults to /bin/sh.

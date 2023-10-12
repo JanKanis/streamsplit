@@ -14,7 +14,7 @@ Test transfer speed by sending data from `/dev/zero`. Use `pv` on `remoteserver`
 
 File transfer:
 
-	streamsplit -i ./mybigfile split 2 'ssh remoteserver streamsplit merge -o ./destinationfile'
+	streamsplit split 2 -i ./mybigfile 'ssh remoteserver streamsplit merge -o ./destinationfile'
 
 
 Build
